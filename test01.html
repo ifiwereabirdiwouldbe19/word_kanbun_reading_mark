@@ -15,6 +15,7 @@
     
 </body>
     <script>
+        const page = document.getElementById('page');
         const fileInput = document.getElementById('fileInput');
         const msg = document.getElementById('msg');
         const list = document.getElementById('list');
@@ -391,20 +392,44 @@
                 }
                 return obj;
             } 
+
+            pagesBox.innerHTML = '';
             //入れ子に整形する。セクションと段落の関係を整理する
             const sections = splitSections(doc);
             for (const sec of sections) {
             const s = readSect(sec.sp, basePt, baseFont);    // ② セクションの設定を読む
+            let inner = null, used = 0;
+
+
+
                 for (const p of sec.paras) {
+                    //文字をとって
                     const para = text_take(p, s);
-                    console.log('段落の中のテキストを取り出しべ');
-                    console.log('段落の中のテキストを取り出したyo', para);
-                    list.textContent = splitLines(para, s);
-                    
+                    //行ごとにわけて
+                    const lines = splitLines(para, s);
+                    //紙につめていく
+                    lines.forEach((line,k) => {
+                        //紙がなかったら新しい紙を作る
+                        if (!inner || used >= s.lines){
+                            //セクションの設定をよみとって紙
+                            inner = makePage(s);
+                            used = 0;
+                        }
+                        //行のdivをつくって紙にいれる
+                        const d = makeLine(line, para, s, k === 0);
+                        inner.appendChild(d);
+                        //行数をカウント
+                        used++;
+                    })
                 }
+                
+                
             } 
 
-            list.textContent = JSON.stringify(sections);
+
+
+            
+            
 
             
 
