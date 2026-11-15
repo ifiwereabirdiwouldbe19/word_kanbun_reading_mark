@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>test</title>
+</head>
+<body>
+    <!-- ファイルを入れるインプット -->
+    <input type="file" id="fileInput" accept=".docx">
+    <p id="msg"></p>
+    <ol id="list"></ol>
+
+    <div id="pages"></div>
+    
+</body>
+    <script>
+        const fileInput = document.getElementById('fileInput');
+        const msg = document.getElementById('msg');
+        const list = document.getElementById('list');
+        const pagesBox = document.getElementById('pages')
+        const mm = tw =>    tw ? Math.round(Number(tw) / 56.6929) : null;    // twip → mm
+        const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const pt = tw => tw / 20;
+        //クロード考案要素の子を取り出す関数と属性を取り出す関数。ない時はnullを返す
+        const child = (el, name) => el && [...el.children].find(c => c.localName === name);
+        const attr  = (el, name) => el ? el.getAttributeNS(W, name) : null;
+        // 句読点や閉じ括弧など、行末に置いてもよい文字のリスト
+        const HANG = '、。，．」』）〕】〉》';                 
+        // 文字の幅を返す関数（半角=0.5、全角=1） 
+        const cellOf = ch => /[ -~｡-ﾟ]/.test(ch) ? 0.5 : 1;     
+        //あとでオブジェクトを入れられるように念のためにオブジェクトようってことを
+        let THEME = {};
+
+        // zipファイルの中身を取り出す関数（クロードに作ってもらった）
+         // 【足す①】圧縮された中身を元に戻す
+        async function inflateRaw(bytes) {
+            const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+            return new Uint8Array(await new Response(stream).arrayBuffer());
+        }
+
+        // 【足す②】箱を開ける：裏表紙 → 目次 → 中身
+        async function unzip(buf) {
+            const u8 = new Uint8Array(buf);
+            const dv = new DataView(buf);
+
+            // 裏表紙（50 4b 05 06）を後ろから探す
+            let eocd = -1;
+            for (let i = u8.length - 22; i >= 0; i--) {
+                if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+            }
+            if (eocd < 0) throw new Error('.docx ではないみたい');
+
+            const count = dv.getUint16(eocd + 10, true);   // 中身の数
+            let p = dv.getUint32(eocd + 16, true);          // 目次の場所
+
+            const files = [];
+            for (let n = 0; n < count; n++) {
+                const method  = dv.getUint16(p + 10, true);  // 0=そのまま 8=圧縮
+                const cSize   = dv.getUint32(p + 20, true);  // 圧縮後の大きさ
+                const nameLen = dv.getUint16(p + 28, true);
+                const extLen  = dv.getUint16(p + 30, true);
+                const cmtLen  = dv.getUint16(p + 32, true);
+                const lo      = dv.getUint32(p + 42, true);  // ラベルの場所
+                const name = new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nameLen));
+
+                // ラベルの後ろが中身
+                const start = lo + 30 + dv.getUint16(lo + 26, true) + dv.getUint16(lo + 28, true);
+                const raw = u8.subarray(start, start + cSize);
+                const data = method === 8 ? await inflateRaw(raw) : raw;
+
+                files.push({ name, data });
+                p += 46 + nameLen + extLen + cmtLen;          // 目次の次の項目へ
+            }
+            return files;
+        }
+
+
+        // ファイルを読み込んで本文のXMLを取り出す関数
+        async function readXML(files,name){
+
+                
+                console.log('次は本文の箇所をみつけるぜ')
+                const airticle = files.find(f => f.name === name);
+                console.log(`${name}の場所をみつけたぜ`, airticle);
+
+                // みつからなかったらさよなら
+                if(!airticle) return null;
+                
+                const airticle_xml = new TextDecoder().decode(airticle.data);
+                console.log('これが本文のXMLよ', airticle_xml);
+                console.log('なんて読みにくいのかしら')
+
+                const doc = new DOMParser().parseFromString(airticle_xml, 'application/xml');
+                console.log('これが本文のXMLをパースしたものよ', doc);
+                return airticle ? doc : null;
+            }
+
+
+        //文字の大きさを取り出す関数
+        function readBaseSize(styles) {
+            let sz = 21;                                       // ❶ 何も書いていなければ 10.5pt
+            if (!styles) return sz / 2;
+
+            // ❷ 文書全体の初期値
+            const def = styles.getElementsByTagNameNS(W, 'docDefaults')[0];
+            const dsz = def && def.getElementsByTagNameNS(W, 'sz')[0];
+            if (dsz) sz = Number(attr(dsz, 'val'));
+
+            // ❸ 標準スタイル（default="1" の段落スタイル）
+            const normal = [...styles.getElementsByTagNameNS(W, 'style')]
+                .find(s => attr(s, 'type') === 'paragraph' && attr(s, 'default') === '1');
+            const nsz = normal && normal.getElementsByTagNameNS(W, 'sz')[0];
+            if (nsz) sz = Number(attr(nsz, 'val'));
+
+            return sz / 2;                                     // ❹ ポイントの2倍で書いてあるので2で割る
+        }
+
+        function readTheme (theme){
+            const t = {};
+            if (!theme)return t;
+            for(const kind of ['major','minor']){
+                const box = theme.getElementsByTagName('a:'+kind+'Font')[0];
+                if(!box)continue;
+                const latin = box.getElementsByTagName('a:latin')[0];
+                const jpan = [...box.getElementsByTagName('a:font')].find(f => f.getAttribute('script') === 'Jpan');
+                t[kind + 'Latin'] = latin ? latin.getAttribute('typeface') : '';
+                t[kind + 'Jpan'] = jpan ? jpan.getAttribute('typeface') : '';
+
+            }
+            return t;
+        }
+
+        function fontFromRFonts(rf,theme){
+            if(!rf)return null;
+            const name = attr(rf,'eastAsia');
+            if(name)return name;
+            const th = attr(rf,'eastAsiaTheme');
+            if(!th)return null;
+            const kind = th.startsWith('major') ? 'major' : 'minor';
+            return /EastAsia$/.test(th) ? theme[kind + 'Jpan'] : theme[kind + 'Latin'];
+
+        }
+        function readBaseFont(styles,theme) { 
+            let font = null;
+            if (!styles)return font;
+            const def = styles.getElementsByTagNameNS(W,'docDefaults')[0];
+            const f1 = fontFromRFonts(def && def.getElementsByTagNameNS(W,'rFonts')[0],theme);
+            if(f1) font = f1;
+            const normal = [...styles.getElementsByTagNameNS(W,'style')].find(s => attr(s,'type') === 'paragraph' && attr(s,'default') === '1');
+            const f2 = fontFromRFonts(normal && normal.getElementsByTagNameNS(W,'rFonts')[0],theme);
+            if(f2) font = f2;
+            return font;
+        }
+
+        const cssFont = name => {
+            const gothic = /ゴシック|Gothic|Sans|メイリオ|Meiryo/i.test(name || '');
+            const fallback = gothic
+                ? "'Yu Gothic', 'Hiragino Sans', 'Noto Sans CJK JP', sans-serif"
+                : "'MS Mincho', 'Yu Mincho', 'Hiragino Mincho ProN', 'Noto Serif CJK JP', serif";
+                return name ? `'${name}',${fallback}` : fallback;
+        }
+
+        //セクションに書かれた設定をオブジェクトに直す関数
+        function readSect(sp, basePt, baseFont) {
+            const pgSz = sp.getElementsByTagNameNS(W, 'pgSz')[0];
+            const pgMar = sp.getElementsByTagNameNS(W, 'pgMar')[0];
+            const grid = sp.getElementsByTagNameNS(W, 'docGrid')[0];
+            const dir = sp.getElementsByTagNameNS(W, 'textDirection')[0];
+            
+            const s = {
+                width: pt(Number(attr(pgSz, 'w'))),  height: pt(Number(attr(pgSz, 'h'))),
+                top: pt(Number(attr(pgMar, 'top'))), bottom: pt(Number(attr(pgMar, 'bottom'))),
+                left: pt(Number(attr(pgMar, 'left'))), right: pt(Number(attr(pgMar, 'right'))),
+                vertical: attr(dir, 'val') === 'tbRl',          // 縦書きなら true
+                fontPt: basePt,                                  // ①で読んだ 16pt
+                font: baseFont,
+            };
+                // 字送り（1字の幅）と行送り（1行の幅）
+            const charSpace = attr(grid, 'charSpace');
+            const linePitch = attr(grid, 'linePitch');
+            s.charPt = charSpace !== null ? basePt + Number(charSpace) / 4096 : basePt;
+            s.linePt = linePitch !== null ? pt(Number(linePitch)) : basePt * 1.5;
+                // 縦書きは「上から下」が1行、横書きは「左から右」が1行
+            const lineLen = s.vertical ? s.height - s.top - s.bottom : s.width - s.left - s.right;
+            const across  = s.vertical ? s.width - s.left - s.right  : s.height - s.top - s.bottom;
+            s.chars = Math.floor(lineLen / s.charPt + 0.01);    // 1行の字数
+            s.lines = Math.floor(across / s.linePt + 0.01);     // 1ページの行数
+
+            return s;
+        };
+         // セクションの中から設定を読む関数(もともとのやつ)
+            // const readSect = sp => {                                         // 1つの sectPr から設定を読む
+            //     const get = (tag, attr) => {
+            //         const el = sp.getElementsByTagNameNS(W, tag)[0];
+            //         return el ? el.getAttributeNS(W, attr) : null;
+            //     };
+            //     return {
+            //         width:  mm(get('pgSz', 'w')),
+            //         height: mm(get('pgSz', 'h')),
+            //         orient: get('pgSz', 'orient') || 'portrait',
+            //         top:    mm(get('pgMar', 'top')),
+            //         bottom: mm(get('pgMar', 'bottom')),
+            //         left:   mm(get('pgMar', 'left')),
+            //         right:  mm(get('pgMar', 'right')),
+            //         dir:    get('textDirection', 'val'),
+            //         type:   get('type', 'val') || 'nextPage',   // 区切りの種類（書いていなければ「次のページから」）
+            //     };
+            // };
+
+                
+        
+        //段落の中のテキストを取り出す関数のもともとのやつ
+        // const text_take = p =>{
+        //     const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
+        //     return text;
+        // }
+        // 段落の中のテキストだけでなく、字下げや行揃え、フォントサイズの情報も取り出す関数
+        function text_take(p,s){
+            const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
+            const pPr = child(p, 'pPr');
+            const ind = child(pPr, 'ind');                       // 字下げの設定
+            const jc = attr(child(pPr, 'jc'), 'val');  
+            const chars = (cName, twName) => {
+            const c = attr(ind, cName);
+            if (c !== null) return Number(c) / 100;          // 〇〇Chars があれば：100 で1字
+                const t = attr(ind, twName);
+                return t !== null ? pt(Number(t)) / s.charPt : 0; // なければ twip → pt → 字数
+            };
+            const left  = chars('leftChars', 'left') || chars('startChars', 'start');
+            const first = chars('firstLineChars', 'firstLine') - chars('hangingChars', 'hanging');
+            const pageBreak = [...p.getElementsByTagNameNS(W, 'br')].some(b => attr(b, 'type') === 'page');
+            const breakBefore = !!child(pPr, 'pageBreakBefore');
+            const run = [...p.getElementsByTagNameNS(W, 'r')].find(r => (r.textContent || '').trim());
+            const sz = run && child(child(run, 'rPr'), 'sz');
+            const sizePt = sz ? Number(attr(sz, 'val')) / 2 : s.fontPt;
+            const font = fontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || s.font;
+            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font };
+        }
+        
+        //段落の文章を行ごとに分割
+        function splitLines(para,s){
+            // 1行に入る文字数を計算する。字下げ分を引く。
+            const one_line = Math.max(1,s.chars - Math.round(para.left));
+            //テキストが空でも、一行として扱う
+            if (!para.text) return [''];
+            const t = para.text, out = [];
+            let start = 0, used = Math.round(para.first);
+            //テキストの文字数分循環
+            for (let i = 0; i < t.length; i++){
+                //半角か全角かで文字の幅を計算
+                const w = cellOf(t[i]);
+
+                //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
+                if ( used + w > one_line && i > start ){
+                    //startからｊまでの文字を切り出してoutに入れる
+                    let j = i;
+                    //大きくなる分が一～二文字文で、かつ「。」とか「、」の時
+                    while (j < t.length && j - i < 2 && HANG.includes(t[j])) j++;  
+                    out.push(t.slice(start, j));
+                    start = j; i = j -1; used = 0;  //startを続きから、
+                    continue;
+                }
+                //最後じゃないなら普通に一文字の幅を足していく
+                used += w;
+            }
+            //。とかじゃなくて普通に最後の一文字なら普通に最後の一行として出す
+            if (start < t.length) out.push(t.slice(start));
+            return out;
+        }
+
+        //wordのzipではテキストが一ページごとに切り分けられていないためHTML上で切り分ける
+        function makePage(s){
+            const page = document.createElement('div');
+            Object.assign(page.style, {
+                width: s.width + 'pt',height: s.height + 'pt',
+                padding: `${s.top}pt ${s.right}pt ${s.bottom}pt ${s.left}pt`,
+                boxSizing: `border-box`,background: `#fff`,margin: `16px auto`,
+                boxShadow: `0 1px 4px rgba(0,0,0,.3)`,overflow: 'hidden',
+            });
+            const inner = document.createElement('div');
+            Object.assign(inner.style,{
+                writingMode: s.vertical ? 'vertical-rl' : 'horizontal-tb',//縦書きか否か
+                fontFamily: cssFont(s.font),
+                fontSize: s.fontPt + 'pt',
+                lineHeight: s.linePt + 'pt',
+                letterSpacing: (s.charPt - s.fontPt) + 'pt',
+                width: '100%',height: '100%',
+            })
+            page.appendChild(inner);
+            pagesBox.appendChild(page);
+            return inner;
+        }
+
+        //ますの線を書く
+        function makeLine(text, para, s, isFirst){
+            const d = document.createElement('div');
+            d.textContent = text || '\u200b';
+            //空白とかそのままにする.\u200bは見えない文字で空白の行でも埋める
+            d.style.whiteSpace = 'pre';
+            d.style.paddingInlineStart = (para.left * s.charPt) + 'pt';
+            if( isFirst && para.first ) d.style.textIndent = ( para.first * s.charPt ) + 'pt';
+            if(para.sizePt !== s.fontPt){
+                d.style.fontSize = para.sizePt + 'pt';
+                d.style.letterSpacing = Math.max(0, s.charPt - para.sizePt ) + 'pt';
+                
+            }
+            if(para.font !== s.font) d.style.fontFamily = cssFont(para.font);//基準のフォントと違かったら元のやつを採用
+            if(para.jc === 'center') d.style.textAlign = 'center';
+            if(para.jc == 'right' || para.jc === 'end') d.style.textAlign = 'end';
+            return d;    
+        }
+
+        function splitSections(doc) {
+            const body = doc.getElementsByTagNameNS(W, 'body')[0];
+            const sections = [];
+            let paras = [];
+            for (const el of body.children) {
+                if (el.localName === 'p') {                        // 段落なら
+                    paras.push(el);                                // 部品をそのままためる
+                    const sp = child(child(el, 'pPr'), 'sectPr');
+                    if (sp) {                                      // 段落の中に sectPr があれば、ここで区切る
+                        sections.push({ sp, paras });
+                        paras = [];
+                    }
+                } else if (el.localName === 'sectPr') {            // body 直下の sectPr（最後のセクション）
+                    sections.push({ sp: el, paras });
+                    paras = [];
+                }
+            }
+            return sections;
+        }
+
+
+
+        // ファイルが選択されたときの処理
+        fileInput.onchange = async function(e) {
+
+            const file = e.target.files[0];
+            if (!file) {return;}
+
+            //wordのファイルをzipとして解凍して中身を取り出す
+            console.log(`選択されたファイルは${file.name}だよ`, file);
+            const buf = await file.arrayBuffer();
+            console.log(`バッファの長さは${buf.byteLength}だよ${buf}`)
+            console.log('これが書いてある。zipの中身',new Uint8Array(buf));
+            console.log('zipの中身を取り出すよ');
+            const files = await unzip(buf);
+            console.log('zipの中身を取り出したよ', files);
+
+            //本文とスタイルのXMLを取り出す関数
+            const doc = await readXML(files, 'word/document.xml');
+            const styles = await readXML(files, 'word/styles.xml');
+            THEME = readTheme( await readXML(files,'word/theme/theme1.xml'));
+            const basePt = readBaseSize(styles);
+            const baseFont = readBaseFont(styles,THEME);
+
+
+            // 全部のセクションを取り出して並べていく
+
+            const sect = doc.getElementsByTagNameNS(W, 'sectPr');
+            console.log(`セクションは${sect.length}個あるわよ`, sect);
+
+            // const last = sect[sect.length - 1];
+            // console.log('設定内容を取り出したわよ', last);
+
+            // //最後のセクションの設定を取り出す
+            // const setting = readSect(last);
+            // console.log('設定内容を含むタグと属性を全部見てみた', whole_get);
+            // console.log('用紙の設定', setting);
+            // // 全体の設定内容をリストに追加する
+            // for (const [key, value] of Object.entries(setting)) {
+            //     const li = document.createElement('li');
+            //     li.textContent = `${key}: ${value}`;
+            //     setting_list.appendChild(li);
+            // }
+
+            //段落を取り出す
+            console.log('次は本文のXMLからテキストを取り出すわよ')
+
+            const ps = [...doc.getElementsByTagNameNS(W, 'p')];
+            console.log('まず段落を取り出したわ', ps);
+
+
+            //段落をオブジェクトに整形する関数
+            const making_obj_for_para = ( p,i ) => {
+                const obj = {
+                    index: i,
+                    text: text_take(p),
+                    el: p
+                }
+                return obj;
+            } 
+            //入れ子に整形する。セクションと段落の関係を整理する
+            const sections = splitSections(doc);
+            for (const sec of sections) {
+            const s = readSect(sec.sp, basePt, baseFont);    // ② セクションの設定を読む
+                for (const p of sec.paras) {
+                    const para = text_take(p, s);
+                    console.log('段落の中のテキストを取り出しべ');
+                    console.log('段落の中のテキストを取り出したyo', para);
+                    list.textContent = splitLines(para, s);
+                    
+                }
+            } 
+
+            list.textContent = JSON.stringify(sections);
+
+            
+
+            // //次のセクションに行くまで段落のオブジェクトをparasに集め、終わったらsectionsに追加する
+            // ps.forEach((p,i) => {
+            //     //パラグラフのオブジェクトをつくって詰めてく
+            //     paras.push(making_obj_for_para(p,i));
+            //     //セクションの終わりか判定する
+            //     const pPr = [...p.children].find(c => c.localName === 'pPr');
+            //     const sp = pPr && [...pPr.children].find(c => c.localName === 'sectPr');
+            //     if (sp) {                                    // ここでセクションが終わる
+            //         //終わったらsectionsに追加してparasを空にする
+            //         sections.push({ no: sections.length + 1, setting: readSect(sp), paras });
+            //         paras = [];
+            //     }
+            // });
+
+
+
+            // //最後のセクションは段落に入っていないため、ここで追加する
+            // const body = doc.getElementsByTagNameNS(W, 'body')[0];
+            // const lastSp = [...body.children].find(c => c.localName === 'sectPr');
+            // sections.push({ no: sections.length + 1, setting: readSect(lastSp), paras });
+            // console.log('入れ子の形', sections);
+
+
+
+
+            // //テキストを取り出す
+            // // console.log('次は段落の中のテキストを取り出すとこんな感じ',ps[0])
+            // // console.log('次は段落の中のテキストを取り出すyo')
+            // // console.log('前にリストに追加した文は消すね')
+            // // main_list.innerHTML = '';
+            // // for (const p of ps) {
+            // //     const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
+            // //     console.log('段落の中のテキストを取り出したyo', text);
+            // //     const li = document.createElement('li');
+            // //     li.textContent = text;
+            // //     main_list.appendChild(li);
+            // //     console.log('段落の中のテキストをリストに追加したyo', li);
+            // // }
+            // list.innerHTML = '';
+            // for (const sec of sections) {
+            //     const li = document.createElement('li');
+            //     const st = sec.setting;
+            //     li.textContent = `セクション${sec.no}（${sec.paras.length}段落／${st.width}×${st.height}mm／余白 上${st.top} 下${st.bottom} 左${st.left} 右${st.right}）`;
+            //     const inner = document.createElement('ol');  // セクションの中に、段落の一覧を入れる
+            //     for (const para of sec.paras) {
+            //         if (!para.text) continue;
+            //         const pli = document.createElement('li');
+            //         pli.value = para.index + 1;              // 番号を文書全体の段落番号にそろえる
+            //         pli.textContent = para.text;
+            //         inner.appendChild(pli);
+            //     }
+            //     li.appendChild(inner);
+            //     list.appendChild(li);
+            // }
+            // const setting = sections[sections.length - 1].setting;
+
+            // msg.textContent = `${file.name}：${ps.length} 段落／${sections.length}セクション／用紙 ${setting.width}×${setting.height}mm ${setting.dir === 'tbRl' ? '縦書き' : '横書き'}／余白 上${setting.top} 下${setting.bottom} 左${setting.left} 右${setting.right}mm`;
+
+        };
+
+
+
+
+
+
+        
+    </script>
+</html>
