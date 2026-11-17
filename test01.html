@@ -228,8 +228,18 @@
                 const t = attr(ind, twName);
                 return t !== null ? pt(Number(t)) / s.charPt : 0; // なければ twip → pt → 字数
             };
-            const left  = chars('leftChars', 'left') || chars('startChars', 'start');
+            //leftcharsは段落全体の字下げ200
+            let left  = chars('leftChars', 'left') || chars('startChars', 'start');
+            const hang = chars('hangingChars', 'hanging');
+            //ぶら下げ分をleftに足したいが、xmlのleftにはすでに足した値のtwipの値が入っているので、その場合は足さないようにする
+            const byChars = attr(ind, 'leftChars') !== null || attr(ind, 'startChars') !== null;
+            if (hang && byChars) {
+                left = hang + left;
+            }
+            //hangingcharsはぶら下げの字下げだから一行目の場合は字上げ1700
+            //firstlinecharsは一行目の字下げ
             const first = chars('firstLineChars', 'firstLine') - chars('hangingChars', 'hanging');
+
             const pageBreak = [...p.getElementsByTagNameNS(W, 'br')].some(b => attr(b, 'type') === 'page');
             const breakBefore = !!child(pPr, 'pageBreakBefore');
             const run = [...p.getElementsByTagNameNS(W, 'r')].find(r => (r.textContent || '').trim());
