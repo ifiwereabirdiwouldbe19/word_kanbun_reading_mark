@@ -15,6 +15,7 @@
     
 </body>
     <script>
+        const page = document.getElementById('page');
         const fileInput = document.getElementById('fileInput');
         const msg = document.getElementById('msg');
         const list = document.getElementById('list');
@@ -26,9 +27,19 @@
         const child = (el, name) => el && [...el.children].find(c => c.localName === name);
         const attr  = (el, name) => el ? el.getAttributeNS(W, name) : null;
         // 句読点や閉じ括弧など、行末に置いてもよい文字のリスト
-        const HANG = '、。，．」』）〕】〉》';                 
+        const HANG = '、。，．」』）〕】〉》';   
+        // 句読点や開き括弧など、くっつくやつ
+
+        const PUNCT = '、。，．「」『』（）〔〕【】〈〉《》';  
+        //行末に入ってはいけないもの
+        const OPEN = '「『（〔【〈《';
         // 文字の幅を返す関数（半角=0.5、全角=1） 
-        const cellOf = ch => /[ -~｡-ﾟ]/.test(ch) ? 0.5 : 1;     
+        const cellOf = (ch,s) => {
+            //半角なのか？ちがうのくぁ？
+            if(/[ -~｡-ﾟ]/.test(ch))return 0.5;
+            if(s.compress && PUNCT.includes(ch))return 0.5;
+            return 1;
+        };     
         //あとでオブジェクトを入れられるように念のためにオブジェクトようってことを
         let THEME = {};
 
@@ -95,6 +106,13 @@
                 console.log('これが本文のXMLをパースしたものよ', doc);
                 return airticle ? doc : null;
             }
+
+        //鍵括弧と句読点を詰めるかどうか設定をみる関数（クロード考案）
+        function readCompress(settings) {
+            if (!settings) return 'doNotCompress';
+            const el = settings.getElementsByTagNameNS(W, 'characterSpacingControl')[0];
+            return attr(el, 'val') || 'doNotCompress';   // 書かれていなければ「詰めない」
+        }
 
 
         //文字の大きさを取り出す関数
@@ -227,8 +245,18 @@
                 const t = attr(ind, twName);
                 return t !== null ? pt(Number(t)) / s.charPt : 0; // なければ twip → pt → 字数
             };
-            const left  = chars('leftChars', 'left') || chars('startChars', 'start');
+            //leftcharsは段落全体の字下げ200
+            let left  = chars('leftChars', 'left') || chars('startChars', 'start');
+            const hang = chars('hangingChars', 'hanging');
+            //ぶら下げ分をleftに足したいが、xmlのleftにはすでに足した値のtwipの値が入っているので、その場合は足さないようにする
+            const byChars = attr(ind, 'leftChars') !== null || attr(ind, 'startChars') !== null;
+            if (hang && byChars) {
+                left = hang + left;
+            }
+            //hangingcharsはぶら下げの字下げだから一行目の場合は字上げ1700
+            //firstlinecharsは一行目の字下げ
             const first = chars('firstLineChars', 'firstLine') - chars('hangingChars', 'hanging');
+
             const pageBreak = [...p.getElementsByTagNameNS(W, 'br')].some(b => attr(b, 'type') === 'page');
             const breakBefore = !!child(pPr, 'pageBreakBefore');
             const run = [...p.getElementsByTagNameNS(W, 'r')].find(r => (r.textContent || '').trim());
@@ -246,19 +274,39 @@
             if (!para.text) return [''];
             const t = para.text, out = [];
             let start = 0, used = Math.round(para.first);
+            let slack = 0;   
+
             //テキストの文字数分循環
             for (let i = 0; i < t.length; i++){
                 //半角か全角かで文字の幅を計算
-                const w = cellOf(t[i]);
-
+                let w = cellOf(t[i], s);
+                if (PUNCT.includes(t[i])) {
+                    const prevP = i > 0 && PUNCT.includes(t[i - 1]);              // 前の文字が約物か
+                    const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
+                    if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
+                }
+                
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
                 if ( used + w > one_line && i > start ){
+                    //前の文字が開きカッコとかだったら詰めて入れなきゃいけないところをいれる
+                    if(s.compress && OPEN.includes(t[i-1])){
+                    
+                            used += w;
+                            continue;
+                        
+                        // if (i - 1 > start) {
+                        //     out.push(t.slice(start, i - 1));
+                        //     start = i - 1; i = i - 2; used = 0; slack = 0;
+                        //     continue;
+                        // }
+                    }
                     //startからｊまでの文字を切り出してoutに入れる
                     let j = i;
                     //大きくなる分が一～二文字文で、かつ「。」とか「、」の時
                     while (j < t.length && j - i < 2 && HANG.includes(t[j])) j++;  
                     out.push(t.slice(start, j));
                     start = j; i = j -1; used = 0;  //startを続きから、
+                    slack = 0;
                     continue;
                 }
                 //最後じゃないなら普通に一文字の幅を足していく
@@ -286,6 +334,7 @@
                 lineHeight: s.linePt + 'pt',
                 letterSpacing: (s.charPt - s.fontPt) + 'pt',
                 width: '100%',height: '100%',
+                textSpacingTrim: 'space-all',
             })
             page.appendChild(inner);
             pagesBox.appendChild(page);
@@ -295,8 +344,27 @@
         //ますの線を書く
         function makeLine(text, para, s, isFirst){
             const d = document.createElement('div');
-            d.textContent = text || '\u200b';
-            //空白とかそのままにする.\u200bは見えない文字で空白の行でも埋める
+
+                if (!text) {
+                    d.textContent = '\u200b';   // 空の行でも高さを持たせる見えない文字
+                } else {
+                    for (let i = 0; i < text.length; i++) {
+                        const ch = text[i];
+                        const prevP = i > 0 && PUNCT.includes(text[i - 1]);               // 前が。とかか
+                        const nextP = i < text.length - 1 && PUNCT.includes(text[i + 1]); // 後ろが。とかか
+                        if (s.compress && PUNCT.includes(ch) && (prevP || nextP)) {
+                            // 続いた場合、 → span で囲んで半分に詰める
+                            const sp = document.createElement('span');
+                            sp.textContent = ch;
+                            sp.style.textSpacingTrim = 'trim-all';
+                            sp.style.letterSpacing = ((s.charPt - s.fontPt) / 2) + 'pt';
+                            d.append(sp);
+                        } else {
+                            // それ以外 → そのまま文字として入れる
+                            d.append(ch);
+                        }
+                    }
+                }
             d.style.whiteSpace = 'pre';
             d.style.paddingInlineStart = (para.left * s.charPt) + 'pt';
             if( isFirst && para.first ) d.style.textIndent = ( para.first * s.charPt ) + 'pt';
@@ -355,6 +423,11 @@
             const basePt = readBaseSize(styles);
             const baseFont = readBaseFont(styles,THEME);
 
+            //鍵括弧と句読点を詰めるかどうか設定をみる関数（クロード考案）
+            const settings = await readXML(files, 'word/settings.xml');
+            const compress = readCompress(settings);
+            console.log('鍵括弧と句読点を詰めてるやついる？', compress);
+
 
             // 全部のセクションを取り出して並べていく
 
@@ -391,20 +464,45 @@
                 }
                 return obj;
             } 
+
+            pagesBox.innerHTML = '';
             //入れ子に整形する。セクションと段落の関係を整理する
             const sections = splitSections(doc);
             for (const sec of sections) {
             const s = readSect(sec.sp, basePt, baseFont);    // ② セクションの設定を読む
+            s.compress = compress !== 'doNotCompress';  // 鍵括弧と句読点を詰めるかどうか
+            let inner = null, used = 0;
+
+
+
                 for (const p of sec.paras) {
+                    //文字をとって
                     const para = text_take(p, s);
-                    console.log('段落の中のテキストを取り出しべ');
-                    console.log('段落の中のテキストを取り出したyo', para);
-                    list.textContent = splitLines(para, s);
-                    
+                    //行ごとにわけて
+                    const lines = splitLines(para, s);
+                    //紙につめていく
+                    lines.forEach((line,k) => {
+                        //紙がなかったら新しい紙を作る
+                        if (!inner || used >= s.lines){
+                            //セクションの設定をよみとって紙
+                            inner = makePage(s);
+                            used = 0;
+                        }
+                        //行のdivをつくって紙にいれる
+                        const d = makeLine(line, para, s, k === 0);
+                        inner.appendChild(d);
+                        //行数をカウント
+                        used++;
+                    })
                 }
+                
+                
             } 
 
-            list.textContent = JSON.stringify(sections);
+
+
+            
+            
 
             
 
