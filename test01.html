@@ -30,7 +30,9 @@
         const HANG = '、。，．」』）〕】〉》';   
         // 句読点や開き括弧など、くっつくやつ
 
-        const PUNCT = '、。，．「」『』（）〔〕【】〈〉《》';              
+        const PUNCT = '、。，．「」『』（）〔〕【】〈〉《》';  
+        //行末に入ってはいけないもの
+        const OPEN = '「『（〔【〈《';
         // 文字の幅を返す関数（半角=0.5、全角=1） 
         const cellOf = (ch,s) => {
             //半角なのか？ちがうのくぁ？
@@ -272,6 +274,8 @@
             if (!para.text) return [''];
             const t = para.text, out = [];
             let start = 0, used = Math.round(para.first);
+            let slack = 0;   
+
             //テキストの文字数分循環
             for (let i = 0; i < t.length; i++){
                 //半角か全角かで文字の幅を計算
@@ -281,14 +285,28 @@
                     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
                     if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
                 }
+                
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
                 if ( used + w > one_line && i > start ){
+                    //前の文字が開きカッコとかだったら詰めて入れなきゃいけないところをいれる
+                    if(s.compress && OPEN.includes(t[i-1])){
+                    
+                            used += w;
+                            continue;
+                        
+                        // if (i - 1 > start) {
+                        //     out.push(t.slice(start, i - 1));
+                        //     start = i - 1; i = i - 2; used = 0; slack = 0;
+                        //     continue;
+                        // }
+                    }
                     //startからｊまでの文字を切り出してoutに入れる
                     let j = i;
                     //大きくなる分が一～二文字文で、かつ「。」とか「、」の時
                     while (j < t.length && j - i < 2 && HANG.includes(t[j])) j++;  
                     out.push(t.slice(start, j));
                     start = j; i = j -1; used = 0;  //startを続きから、
+                    slack = 0;
                     continue;
                 }
                 //最後じゃないなら普通に一文字の幅を足していく
