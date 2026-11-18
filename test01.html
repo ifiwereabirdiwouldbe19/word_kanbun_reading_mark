@@ -27,9 +27,17 @@
         const child = (el, name) => el && [...el.children].find(c => c.localName === name);
         const attr  = (el, name) => el ? el.getAttributeNS(W, name) : null;
         // 句読点や閉じ括弧など、行末に置いてもよい文字のリスト
-        const HANG = '、。，．」』）〕】〉》';                 
+        const HANG = '、。，．」』）〕】〉》';   
+        // 句読点や開き括弧など、くっつくやつ
+
+        const PUNCT = '、。，．「」『』（）〔〕【】〈〉《》';              
         // 文字の幅を返す関数（半角=0.5、全角=1） 
-        const cellOf = ch => /[ -~｡-ﾟ]/.test(ch) ? 0.5 : 1;     
+        const cellOf = (ch,s) => {
+            //半角なのか？ちがうのくぁ？
+            if(/[ -~｡-ﾟ]/.test(ch))return 0.5;
+            if(s.compress && PUNCT.includes(ch))return 0.5;
+            return 1;
+        };     
         //あとでオブジェクトを入れられるように念のためにオブジェクトようってことを
         let THEME = {};
 
@@ -96,6 +104,13 @@
                 console.log('これが本文のXMLをパースしたものよ', doc);
                 return airticle ? doc : null;
             }
+
+        //鍵括弧と句読点を詰めるかどうか設定をみる関数（クロード考案）
+        function readCompress(settings) {
+            if (!settings) return 'doNotCompress';
+            const el = settings.getElementsByTagNameNS(W, 'characterSpacingControl')[0];
+            return attr(el, 'val') || 'doNotCompress';   // 書かれていなければ「詰めない」
+        }
 
 
         //文字の大きさを取り出す関数
@@ -260,8 +275,12 @@
             //テキストの文字数分循環
             for (let i = 0; i < t.length; i++){
                 //半角か全角かで文字の幅を計算
-                const w = cellOf(t[i]);
-
+                let w = cellOf(t[i], s);
+                if (PUNCT.includes(t[i])) {
+                    const prevP = i > 0 && PUNCT.includes(t[i - 1]);              // 前の文字が約物か
+                    const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
+                    if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
+                }
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
                 if ( used + w > one_line && i > start ){
                     //startからｊまでの文字を切り出してoutに入れる
@@ -297,6 +316,7 @@
                 lineHeight: s.linePt + 'pt',
                 letterSpacing: (s.charPt - s.fontPt) + 'pt',
                 width: '100%',height: '100%',
+                textSpacingTrim: 'space-all',
             })
             page.appendChild(inner);
             pagesBox.appendChild(page);
@@ -306,8 +326,27 @@
         //ますの線を書く
         function makeLine(text, para, s, isFirst){
             const d = document.createElement('div');
-            d.textContent = text || '\u200b';
-            //空白とかそのままにする.\u200bは見えない文字で空白の行でも埋める
+
+                if (!text) {
+                    d.textContent = '\u200b';   // 空の行でも高さを持たせる見えない文字
+                } else {
+                    for (let i = 0; i < text.length; i++) {
+                        const ch = text[i];
+                        const prevP = i > 0 && PUNCT.includes(text[i - 1]);               // 前が。とかか
+                        const nextP = i < text.length - 1 && PUNCT.includes(text[i + 1]); // 後ろが。とかか
+                        if (s.compress && PUNCT.includes(ch) && (prevP || nextP)) {
+                            // 続いた場合、 → span で囲んで半分に詰める
+                            const sp = document.createElement('span');
+                            sp.textContent = ch;
+                            sp.style.textSpacingTrim = 'trim-all';
+                            sp.style.letterSpacing = ((s.charPt - s.fontPt) / 2) + 'pt';
+                            d.append(sp);
+                        } else {
+                            // それ以外 → そのまま文字として入れる
+                            d.append(ch);
+                        }
+                    }
+                }
             d.style.whiteSpace = 'pre';
             d.style.paddingInlineStart = (para.left * s.charPt) + 'pt';
             if( isFirst && para.first ) d.style.textIndent = ( para.first * s.charPt ) + 'pt';
@@ -366,6 +405,11 @@
             const basePt = readBaseSize(styles);
             const baseFont = readBaseFont(styles,THEME);
 
+            //鍵括弧と句読点を詰めるかどうか設定をみる関数（クロード考案）
+            const settings = await readXML(files, 'word/settings.xml');
+            const compress = readCompress(settings);
+            console.log('鍵括弧と句読点を詰めてるやついる？', compress);
+
 
             // 全部のセクションを取り出して並べていく
 
@@ -408,6 +452,7 @@
             const sections = splitSections(doc);
             for (const sec of sections) {
             const s = readSect(sec.sp, basePt, baseFont);    // ② セクションの設定を読む
+            s.compress = compress !== 'doNotCompress';  // 鍵括弧と句読点を詰めるかどうか
             let inner = null, used = 0;
 
 
