@@ -20,6 +20,7 @@
         const msg = document.getElementById('msg');
         const list = document.getElementById('list');
         const pagesBox = document.getElementById('pages')
+        const isLatin = c => /[!-~]/.test(c);
         const mm = tw =>    tw ? Math.round(Number(tw) / 56.6929) : null;    // twip → mm
         const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
         const pt = tw => tw / 20;
@@ -40,6 +41,13 @@
             if(s.compress && PUNCT.includes(ch))return 0.5;
             return 1;
         };     
+        const measureCtx = document.createElement('canvas').getContext('2d');
+        //クロード考案、英数字を幅をはかってマスにあてはめる関数
+        function latinCells(str, s, font) {
+            measureCtx.font = `${s.fontPt}pt ${cssFont(font)}`;
+            const px = measureCtx.measureText(str).width;   // 幅（px）
+            return px / (s.charPt * 4 / 3);                 // 1マス（pt → px）で割る
+        }
         //あとでオブジェクトを入れられるように念のためにオブジェクトようってことを
         let THEME = {};
 
@@ -235,7 +243,28 @@
         // }
         // 段落の中のテキストだけでなく、字下げや行揃え、フォントサイズの情報も取り出す関数
         function text_take(p,s){
-            const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
+            let text = '';
+            const tcy = [];
+            for (const r of p.getElementsByTagNameNS(W, 'r')) {
+                let rt = '';
+                //brの時は改行しなきゃいけないから、brの時は改行を入れるようにする
+                for (const c of r.children){
+                    if(c.localName === 't'){
+                        rt += c.textContent;
+                    }else if (c.localName === 'br'){
+                        const type = attr(c,'type');
+                        if(type !== 'page' && type !== 'column') rt += '\n';
+                    }
+                }
+                // const rt = [...r.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
+                if (!rt) continue;
+                const v = attr(child(child(r, 'rPr'), 'eastAsianLayout'), 'vert');
+                if (v && v !== '0' && v !== 'false' && v !== 'off') {
+                    tcy.push({ start: text.length, end: text.length + rt.length });
+                }
+                text += rt;
+            }
+            // const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
             const pPr = child(p, 'pPr');
             const ind = child(pPr, 'ind');                       // 字下げの設定
             const jc = attr(child(pPr, 'jc'), 'val');  
@@ -263,7 +292,7 @@
             const sz = run && child(child(run, 'rPr'), 'sz');
             const sizePt = sz ? Number(attr(sz, 'val')) / 2 : s.fontPt;
             const font = fontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || s.font;
-            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font };
+            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy };
         }
         
         //段落の文章を行ごとに分割
@@ -275,11 +304,43 @@
             const t = para.text, out = [];
             let start = 0, used = Math.round(para.first);
             let slack = 0;   
+            
 
             //テキストの文字数分循環
             for (let i = 0; i < t.length; i++){
+                if(t[i] === '\n'){
+                    //縦中横数えるやつには\nが一文字に入るらしいんでbrのところ新しく改行するところは\nも含めちゃう
+                    out.push(t.slice(start, i + 1));
+                    start = i + 1;
+                    used = 0;
+                    slack = 0;
+                    continue;
+                }
+                const g = para.tcy.find(g => g.start === i);
                 //半角か全角かで文字の幅を計算
                 let w = cellOf(t[i], s);
+                let len = 1;
+                if (g) {
+                    w = 1;
+                    len = g.end - g.start;//100とかだったら3,20とかだったら２
+                }else if(isLatin(t[i])){
+                        let k = i;
+                        while (k < t.length && isLatin(t[k]) && !para.tcy.some(g => g.start === k)) k++;
+                        w = latinCells(t.slice(i, k), s, para.font);
+                        len = k - i;
+                        if (w > one_line) {          // 1行に収まらないほど長い単語は、1文字ずつに戻す
+                            w = latinCells(t[i], s, para.font);
+                            len = 1;
+                        }
+                                        
+                }else if (PUNCT.includes(t[i])){
+                    const prevP = i > 0 && PUNCT.includes(t[i - 1]);
+                    const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);
+                    if (!prevP && !nextP) w = 1;
+                }
+
+            
+
                 if (PUNCT.includes(t[i])) {
                     const prevP = i > 0 && PUNCT.includes(t[i - 1]);              // 前の文字が約物か
                     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
@@ -288,6 +349,11 @@
                 
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
                 if ( used + w > one_line && i > start ){
+                        if (s.compress && used + w - one_line <= slack) {
+                            used += w;
+                            i += len - 1;
+                            continue;
+                        }
                     //前の文字が開きカッコとかだったら詰めて入れなきゃいけないところをいれる
                     if(s.compress && OPEN.includes(t[i-1])){
                     
@@ -311,6 +377,11 @@
                 }
                 //最後じゃないなら普通に一文字の幅を足していく
                 used += w;
+                if (s.compress && PUNCT.includes(t[i]) && w === 1) slack += 0.2;
+
+                //縦中横の場合は数字は一文字としてカウントするから、そう進める
+                 i += len - 1;
+                
             }
             //。とかじゃなくて普通に最後の一文字なら普通に最後の一行として出す
             if (start < t.length) out.push(t.slice(start));
@@ -342,13 +413,35 @@
         }
 
         //ますの線を書く
-        function makeLine(text, para, s, isFirst){
+        function makeLine(text, para, s, isFirst,off = 0){
             const d = document.createElement('div');
 
                 if (!text) {
                     d.textContent = '\u200b';   // 空の行でも高さを持たせる見えない文字
                 } else {
                     for (let i = 0; i < text.length; i++) {
+                        //ここは縦中横kana？
+                        const g = para.tcy.find(g => g.start === off + i );
+                        if(g){
+                            const len = g.end - g.start;
+                            const sp = document.createElement('span');
+                            sp.textContent = text.slice(i,i + len);//縦中横の文字までの分をとりだして入れる
+                            sp.style.textCombineUpright = 'all';
+                            d.append(sp);
+                            i += len - 1;
+                            continue;
+                        }
+                        //英字判定
+                        if (isLatin(text[i])) {
+                            let k = i;
+                            while (k < text.length && isLatin(text[k]) && !para.tcy.some(g => g.start === off + k)) k++;
+                            const sp = document.createElement('span');
+                            sp.textContent = text.slice(i, k);
+                            sp.style.letterSpacing = '0';
+                            d.append(sp);
+                            i = k - 1;
+                            continue;
+                        }
                         const ch = text[i];
                         const prevP = i > 0 && PUNCT.includes(text[i - 1]);               // 前が。とかか
                         const nextP = i < text.length - 1 && PUNCT.includes(text[i + 1]); // 後ろが。とかか
@@ -478,8 +571,13 @@
                 for (const p of sec.paras) {
                     //文字をとって
                     const para = text_take(p, s);
+
                     //行ごとにわけて
                     const lines = splitLines(para, s);
+
+                    //offには、その行が何文字目からはじまるかいれる
+                    let off = 0;
+
                     //紙につめていく
                     lines.forEach((line,k) => {
                         //紙がなかったら新しい紙を作る
@@ -489,10 +587,11 @@
                             used = 0;
                         }
                         //行のdivをつくって紙にいれる
-                        const d = makeLine(line, para, s, k === 0);
+                        const d = makeLine(line, para, s, k === 0,off);
                         inner.appendChild(d);
                         //行数をカウント
                         used++;
+                        off += line.length;
                     })
                 }
                 
