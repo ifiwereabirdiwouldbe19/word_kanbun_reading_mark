@@ -23,6 +23,12 @@
         const isLatin = c => /[!-~]/.test(c);
         const mm = tw =>    tw ? Math.round(Number(tw) / 56.6929) : null;    // twip → mm
         const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+        const WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
+        const A  = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+        const R  = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+        const emu = v => Number(v) / 12700;      // EMU → pt
+        let RELS = {};                           // rId → 画像ファイルの場所
+        let FILES = [];                          // zip の中身
         const pt = tw => tw / 20;
         //クロード考案要素の子を取り出す関数と属性を取り出す関数。ない時はnullを返す
         const child = (el, name) => el && [...el.children].find(c => c.localName === name);
@@ -32,8 +38,27 @@
         // 句読点や開き括弧など、くっつくやつ
 
         const PUNCT = '、。，．「」『』（）〔〕【】〈〉《》';  
+        // 閉じる側（句読点・閉じ括弧）
+        const CLOSE = '、。，．」』）〕】〉》';
         //行末に入ってはいけないもの
         const OPEN = '「『（〔【〈《';
+
+
+        const halfAt = (t, i) =>{
+            const prev = t[i - 1], next = t[i+1];
+            if (CLOSE.includes(t[i]) && next !== undefined ){
+                if (OPEN.includes(next) || next === ' ')return true;
+            }
+            if (OPEN.includes(t[i]) && prev !== undefined) {
+                if (CLOSE.includes(prev) || prev === ' ') return true;
+            }
+            return false;
+        }
+
+
+        // (CLOSE.includes(t[i]) && OPEN.includes(t[i + 1] ?? '')) ||
+        // (OPEN.includes(t[i]) && CLOSE.includes(t[i - 1] ?? ''));
+
         // 文字の幅を返す関数（半角=0.5、全角=1） 
         const cellOf = (ch,s) => {
             //半角なのか？ちがうのくぁ？
@@ -245,6 +270,7 @@
         function text_take(p,s){
             let text = '';
             const tcy = [];
+            const images = [];
             for (const r of p.getElementsByTagNameNS(W, 'r')) {
                 let rt = '';
                 //brの時は改行しなきゃいけないから、brの時は改行を入れるようにする
@@ -254,6 +280,9 @@
                     }else if (c.localName === 'br'){
                         const type = attr(c,'type');
                         if(type !== 'page' && type !== 'column') rt += '\n';
+                    }else if (c.localName === 'drawing') {
+                        const im = readDrawing(c);
+                        if (im) images.push(im);
                     }
                 }
                 // const rt = [...r.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
@@ -292,7 +321,7 @@
             const sz = run && child(child(run, 'rPr'), 'sz');
             const sizePt = sz ? Number(attr(sz, 'val')) / 2 : s.fontPt;
             const font = fontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || s.font;
-            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy };
+            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy, images };
         }
         
         //段落の文章を行ごとに分割
@@ -332,40 +361,51 @@
                             w = latinCells(t[i], s, para.font);
                             len = 1;
                         }
-                                        
-                }else if (PUNCT.includes(t[i])){
-                    const prevP = i > 0 && PUNCT.includes(t[i - 1]);
-                    const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);
-                    if (!prevP && !nextP) w = 1;
+                         
+                }else if (PUNCT.includes(t[i])) {
+                    w = (s.compress && halfAt(t, i)) ? 0.5 : 1;
                 }
+                // }else if (PUNCT.includes(t[i])){
+                //     const prevP = i > 0 && PUNCT.includes(t[i - 1]);
+                //     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);
+                //     if (!prevP && !nextP) w = 1;
+                // }
 
             
 
-                if (PUNCT.includes(t[i])) {
-                    const prevP = i > 0 && PUNCT.includes(t[i - 1]);              // 前の文字が約物か
-                    const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
-                    if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
-                }
+                // if (PUNCT.includes(t[i])) {
+                //     const prevP = i > 0 && PUNCT.includes(t[i - 1]);              // 前の文字が約物か
+                //     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
+                //     if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
+                // }
                 
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
                 if ( used + w > one_line && i > start ){
-                        if (s.compress && used + w - one_line <= slack) {
+                        const next = t[i + len] ?? '';
+                        const kinsoku = OPEN.includes(t[i - 1]) || HANG.includes(next);
+                        if (s.compress && kinsoku && used + w - one_line <= slack) {
                             used += w;
+                            if (s.compress && PUNCT.includes(t[i]) && w === 1) slack += 0.5;
                             i += len - 1;
                             continue;
                         }
-                    //前の文字が開きカッコとかだったら詰めて入れなきゃいけないところをいれる
-                    if(s.compress && OPEN.includes(t[i-1])){
+                    //     if (s.compress && used + w - one_line <= slack) {
+                    //         used += w;
+                    //         i += len - 1;
+                    //         continue;
+                    //     }
+                    // //前の文字が開きカッコとかだったら詰めて入れなきゃいけないところをいれる
+                    // if(s.compress && OPEN.includes(t[i-1])){
                     
-                            used += w;
-                            continue;
+                    //         used += w;
+                    //         continue;
                         
-                        // if (i - 1 > start) {
-                        //     out.push(t.slice(start, i - 1));
-                        //     start = i - 1; i = i - 2; used = 0; slack = 0;
-                        //     continue;
-                        // }
-                    }
+                    //     // if (i - 1 > start) {
+                    //     //     out.push(t.slice(start, i - 1));
+                    //     //     start = i - 1; i = i - 2; used = 0; slack = 0;
+                    //     //     continue;
+                    //     // }
+                    // }
                     //startからｊまでの文字を切り出してoutに入れる
                     let j = i;
                     //大きくなる分が一～二文字文で、かつ「。」とか「、」の時
@@ -377,7 +417,7 @@
                 }
                 //最後じゃないなら普通に一文字の幅を足していく
                 used += w;
-                if (s.compress && PUNCT.includes(t[i]) && w === 1) slack += 0.2;
+                if (s.compress && PUNCT.includes(t[i]) && w === 1) slack += 0.5;
 
                 //縦中横の場合は数字は一文字としてカウントするから、そう進める
                  i += len - 1;
@@ -406,6 +446,8 @@
                 letterSpacing: (s.charPt - s.fontPt) + 'pt',
                 width: '100%',height: '100%',
                 textSpacingTrim: 'space-all',
+                position: 'relative',
+                zIndex: '1'
             })
             page.appendChild(inner);
             pagesBox.appendChild(page);
@@ -492,6 +534,70 @@
             return sections;
         }
 
+        //クロード考案、画像の場所を調べてURLにする関数群
+        // rels を読んで { rId9: 'media/image1.png', … } にする
+        function readRels(rels) {
+            const map = {};
+            if (!rels) return map;
+            for (const el of rels.getElementsByTagName('Relationship')) {
+                map[el.getAttribute('Id')] = el.getAttribute('Target');
+            }
+            return map;
+        }
+
+        // rId から、ブラウザで表示できる URL を作る
+        function imageURL(rid) {
+            const target = RELS[rid];
+            if (!target) return null;
+            const path = target.startsWith('/') ? target.slice(1) : 'word/' + target;
+            const f = FILES.find(f => f.name === path);
+            if (!f) return null;
+            const ext = path.split('.').pop().toLowerCase();
+            const type = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp' }[ext] || '';
+            return URL.createObjectURL(new Blob([f.data], { type }));
+        }
+
+        // <w:drawing> から、大きさ・位置・画像の番号を読む
+        function readDrawing(dr) {
+            const anchor = dr.getElementsByTagNameNS(WP, 'anchor')[0];
+            const box = anchor || dr.getElementsByTagNameNS(WP, 'inline')[0];
+            if (!box) return null;
+            const ext  = box.getElementsByTagNameNS(WP, 'extent')[0];
+            const blip = dr.getElementsByTagNameNS(A, 'blip')[0];
+            const pos = tag => {
+                const p = box.getElementsByTagNameNS(WP, tag)[0];
+                const o = p && p.getElementsByTagNameNS(WP, 'posOffset')[0];
+                return { from: p ? p.getAttribute('relativeFrom') : 'column', off: o ? emu(o.textContent) : 0 };
+            };
+            return {
+                rid: blip && blip.getAttributeNS(R, 'embed'),
+                w: emu(ext.getAttribute('cx')),
+                h: emu(ext.getAttribute('cy')),
+                behind: !!anchor && anchor.getAttribute('behindDoc') === '1',
+                posH: pos('positionH'),
+                posV: pos('positionV'),
+            };
+        }
+        function placeImages(para, s, inner) {
+            const page = inner.parentElement;           // 紙そのもの
+            page.style.position = 'relative';
+            for (const im of para.images) {
+                const url = imageURL(im.rid);
+                if (!url) continue;
+                // 「page」基準なら紙の端から、それ以外は本文の領域（余白の内側）から測る
+                const x = (im.posH.from === 'page' ? 0 : s.left) + im.posH.off;
+                const y = (im.posV.from === 'page' ? 0 : s.top)  + im.posV.off;
+                const el = document.createElement('img');
+                el.src = url;
+                Object.assign(el.style, {
+                    position: 'absolute',
+                    left: x + 'pt', top: y + 'pt',
+                    width: im.w + 'pt', height: im.h + 'pt',
+                    zIndex: im.behind ? '0' : '2',      // 文字の後ろなら下、前なら上
+                });
+                page.appendChild(el);
+            }
+        }
 
 
         // ファイルが選択されたときの処理
@@ -513,6 +619,8 @@
             const doc = await readXML(files, 'word/document.xml');
             const styles = await readXML(files, 'word/styles.xml');
             THEME = readTheme( await readXML(files,'word/theme/theme1.xml'));
+            FILES = files;
+            RELS = readRels(await readXML(files, 'word/_rels/document.xml.rels'));
             const basePt = readBaseSize(styles);
             const baseFont = readBaseFont(styles,THEME);
 
@@ -589,6 +697,7 @@
                         //行のdivをつくって紙にいれる
                         const d = makeLine(line, para, s, k === 0,off);
                         inner.appendChild(d);
+                        if (k === 0 && para.images.length) placeImages(para, s, inner); 
                         //行数をカウント
                         used++;
                         off += line.length;
