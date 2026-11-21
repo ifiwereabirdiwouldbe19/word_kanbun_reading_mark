@@ -192,6 +192,14 @@
             return /EastAsia$/.test(th) ? theme[kind + 'Jpan'] : theme[kind + 'Latin'];
 
         }
+        function latinFontFromRFonts(rf, theme) {
+            if (!rf) return null;
+            const name = attr(rf, 'ascii');
+            if (name) return name;
+            const th = attr(rf, 'asciiTheme');
+            if (!th) return null;
+            return theme[(th.startsWith('major') ? 'major' : 'minor') + 'Latin'];
+        }
         function readBaseFont(styles,theme) { 
             let font = null;
             if (!styles)return font;
@@ -271,7 +279,12 @@
             let text = '';
             const tcy = [];
             const images = [];
+            const inTextBox = el => {
+                for (let e = el.parentNode;e; e = e.parentNode) if (e.localName === 'txbxContent') return true;
+                return false;
+            }
             for (const r of p.getElementsByTagNameNS(W, 'r')) {
+                if(inTextBox(r)) continue;
                 let rt = '';
                 //brの時は改行しなきゃいけないから、brの時は改行を入れるようにする
                 for (const c of r.children){
@@ -285,11 +298,17 @@
                         if (im) images.push(im);
                     }
                 }
+
                 // const rt = [...r.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
                 if (!rt) continue;
-                const v = attr(child(child(r, 'rPr'), 'eastAsianLayout'), 'vert');
+                const ea = child(child(r,'rPr'),'eastAsianLayout');
+                const v = attr(ea,'vert');
+                // const v = attr(child(child(r, 'rPr'), 'eastAsianLayout'), 'vert');
                 if (v && v !== '0' && v !== 'false' && v !== 'off') {
-                    tcy.push({ start: text.length, end: text.length + rt.length });
+                    const id = attr(ea, 'id');
+                    const last = tcy[tcy.length - 1];
+                    if (last && id !== null && last.id === id && last.end === text.length) last.end += rt.length;
+                    else tcy.push({ start: text.length, end: text.length + rt.length, id });
                 }
                 text += rt;
             }
@@ -317,11 +336,13 @@
 
             const pageBreak = [...p.getElementsByTagNameNS(W, 'br')].some(b => attr(b, 'type') === 'page');
             const breakBefore = !!child(pPr, 'pageBreakBefore');
-            const run = [...p.getElementsByTagNameNS(W, 'r')].find(r => (r.textContent || '').trim());
+            // const run = [...p.getElementsByTagNameNS(W, 'r')].find(r => (r.textContent || '').trim());
+            const run = [...p.getElementsByTagNameNS(W, 'r')].find(r => !inTextBox(r) && (r.textContent || '').trim());
             const sz = run && child(child(run, 'rPr'), 'sz');
             const sizePt = sz ? Number(attr(sz, 'val')) / 2 : s.fontPt;
             const font = fontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || s.font;
-            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy, images };
+            const latinFont = latinFontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || font;
+            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy, images, latinFont };
         }
         
         //段落の文章を行ごとに分割
@@ -378,11 +399,11 @@
                 //     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
                 //     if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
                 // }
-                
+                const tol = (s.charPt - s.fontPt) / s.charPt;
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
-                if ( used + w > one_line && i > start ){
+                if ( used + w > one_line + tol && i > start ){
                         const next = t[i + len] ?? '';
-                        const kinsoku = OPEN.includes(t[i - 1]) || HANG.includes(next);
+                        const kinsoku = OPEN.includes(t[i - 1]); //|| HANG.includes(next);
                         if (s.compress && kinsoku && used + w - one_line <= slack) {
                             used += w;
                             if (s.compress && PUNCT.includes(t[i]) && w === 1) slack += 0.5;
@@ -511,6 +532,7 @@
             if(para.font !== s.font) d.style.fontFamily = cssFont(para.font);//基準のフォントと違かったら元のやつを採用
             if(para.jc === 'center') d.style.textAlign = 'center';
             if(para.jc == 'right' || para.jc === 'end') d.style.textAlign = 'end';
+            
             return d;    
         }
 
@@ -619,6 +641,7 @@
             const doc = await readXML(files, 'word/document.xml');
             const styles = await readXML(files, 'word/styles.xml');
             THEME = readTheme( await readXML(files,'word/theme/theme1.xml'));
+            // console.log('THEMEとは',THEME)
             FILES = files;
             RELS = readRels(await readXML(files, 'word/_rels/document.xml.rels'));
             const basePt = readBaseSize(styles);
