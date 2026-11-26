@@ -8,6 +8,7 @@
 <body>
     <!-- ファイルを入れるインプット -->
     <input type="file" id="fileInput" accept=".docx">
+    <button id="saveBtn">docxで保存</button>
     <p id="msg"></p>
     <ol id="list"></ol>
 
@@ -29,6 +30,11 @@
         const emu = v => Number(v) / 12700;      // EMU → pt
         let RELS = {};                           // rId → 画像ファイルの場所
         let FILES = [];                          // zip の中身
+        let DOC = null ;
+        let CTX = null;
+        let PARAS = [];
+        let FILE_NAME = '';
+
         const pt = tw => tw / 20;
         //クロード考案要素の子を取り出す関数と属性を取り出す関数。ない時はnullを返す
         const child = (el, name) => el && [...el.children].find(c => c.localName === name);
@@ -42,7 +48,6 @@
         const CLOSE = '、。，．」』）〕】〉》';
         //行末に入ってはいけないもの
         const OPEN = '「『（〔【〈《';
-
 
         const halfAt = (t, i) =>{
             const prev = t[i - 1], next = t[i+1];
@@ -117,6 +122,41 @@
                 p += 46 + nameLen + extLen + cmtLen;          // 目次の次の項目へ
             }
             return files;
+        }
+
+        //zipを作る関数（クロード作成）
+                // CRC32（zip に入れるファイルごとの検査用の数）を計算するための表
+        const CRC = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n;
+            for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+        const crc32 = u8 => { let c = 0xFFFFFFFF; for (const b of u8) c = CRC[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+
+        // files（{name, data} の配列）を zip にする。unzip の逆
+        function zip(files) {
+            const enc = new TextEncoder(), parts = [], central = [];
+            let offset = 0;
+            for (const f of files) {
+                const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+                const lh = new DataView(new ArrayBuffer(30));          // ラベル（各ファイルの前に付ける）
+                lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+                lh.setUint16(12, 0x21, true);
+                lh.setUint32(14, crc, true); lh.setUint32(18, size, true); lh.setUint32(22, size, true);
+                lh.setUint16(26, name.length, true);
+                parts.push(new Uint8Array(lh.buffer), name, f.data);
+
+                const ch = new DataView(new ArrayBuffer(46));          // 目次の1項目
+                ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+                ch.setUint16(8, 0x0800, true); ch.setUint16(14, 0x21, true);
+                ch.setUint32(16, crc, true); ch.setUint32(20, size, true); ch.setUint32(24, size, true);
+                ch.setUint16(28, name.length, true); ch.setUint32(42, offset, true);
+                central.push(new Uint8Array(ch.buffer), name);
+                offset += 30 + name.length + size;
+            }
+            const cdSize = central.reduce((n, a) => n + a.length, 0);
+            const end = new DataView(new ArrayBuffer(22));             // 裏表紙
+            end.setUint32(0, 0x06054b50, true);
+            end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+            end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+            return new Blob([...parts, ...central, new Uint8Array(end.buffer)]);
         }
 
 
@@ -248,32 +288,7 @@
 
             return s;
         };
-         // セクションの中から設定を読む関数(もともとのやつ)
-            // const readSect = sp => {                                         // 1つの sectPr から設定を読む
-            //     const get = (tag, attr) => {
-            //         const el = sp.getElementsByTagNameNS(W, tag)[0];
-            //         return el ? el.getAttributeNS(W, attr) : null;
-            //     };
-            //     return {
-            //         width:  mm(get('pgSz', 'w')),
-            //         height: mm(get('pgSz', 'h')),
-            //         orient: get('pgSz', 'orient') || 'portrait',
-            //         top:    mm(get('pgMar', 'top')),
-            //         bottom: mm(get('pgMar', 'bottom')),
-            //         left:   mm(get('pgMar', 'left')),
-            //         right:  mm(get('pgMar', 'right')),
-            //         dir:    get('textDirection', 'val'),
-            //         type:   get('type', 'val') || 'nextPage',   // 区切りの種類（書いていなければ「次のページから」）
-            //     };
-            // };
-
-                
-        
-        //段落の中のテキストを取り出す関数のもともとのやつ
-        // const text_take = p =>{
-        //     const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
-        //     return text;
-        // }
+ 
         // 段落の中のテキストだけでなく、字下げや行揃え、フォントサイズの情報も取り出す関数
         function text_take(p,s){
             let text = '';
@@ -386,19 +401,7 @@
                 }else if (PUNCT.includes(t[i])) {
                     w = (s.compress && halfAt(t, i)) ? 0.5 : 1;
                 }
-                // }else if (PUNCT.includes(t[i])){
-                //     const prevP = i > 0 && PUNCT.includes(t[i - 1]);
-                //     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);
-                //     if (!prevP && !nextP) w = 1;
-                // }
 
-            
-
-                // if (PUNCT.includes(t[i])) {
-                //     const prevP = i > 0 && PUNCT.includes(t[i - 1]);              // 前の文字が約物か
-                //     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
-                //     if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
-                // }
                 const tol = (s.charPt - s.fontPt) / s.charPt;
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
                 if ( used + w > one_line + tol && i > start ){
@@ -410,23 +413,7 @@
                             i += len - 1;
                             continue;
                         }
-                    //     if (s.compress && used + w - one_line <= slack) {
-                    //         used += w;
-                    //         i += len - 1;
-                    //         continue;
-                    //     }
-                    // //前の文字が開きカッコとかだったら詰めて入れなきゃいけないところをいれる
-                    // if(s.compress && OPEN.includes(t[i-1])){
-                    
-                    //         used += w;
-                    //         continue;
-                        
-                    //     // if (i - 1 > start) {
-                    //     //     out.push(t.slice(start, i - 1));
-                    //     //     start = i - 1; i = i - 2; used = 0; slack = 0;
-                    //     //     continue;
-                    //     // }
-                    // }
+
                     //startからｊまでの文字を切り出してoutに入れる
                     let j = i;
                     //大きくなる分が一～二文字文で、かつ「。」とか「、」の時
@@ -621,6 +608,54 @@
             }
         }
 
+        function render() {
+            
+            pagesBox.innerHTML = '';
+            //からにする
+            PARAS = [];
+            console.log('からにするよ')
+
+            //入れ子に整形する。セクションと段落の関係を整理する
+            const sections = splitSections(DOC);
+            for (const sec of sections) {
+            const s = readSect(sec.sp, CTX.basePt, CTX.baseFont);    // ② セクションの設定を読む
+            s.compress = CTX.compress !== 'doNotCompress';  // 鍵括弧と句読点を詰めるかどうか
+            let inner = null, used = 0;
+
+
+
+                for (const p of sec.paras) {
+                    //文字をとって
+                    const para = text_take(p, s);
+                    para.no = PARAS.length;
+                    PARAS.push(para);
+
+                    //行ごとにわけて
+                    const lines = splitLines(para, s);
+
+                    //offには、その行が何文字目からはじまるかいれる
+                    let off = 0;
+
+                    //紙につめていく
+                    lines.forEach((line,k) => {
+                        //紙がなかったら新しい紙を作る
+                        if (!inner || used >= s.lines){
+                            //セクションの設定をよみとって紙
+                            inner = makePage(s);
+                            used = 0;
+                        }
+                        //行のdivをつくって紙にいれる
+                        const d = makeLine(line, para, s, k === 0,off);
+                        inner.appendChild(d);
+                        if (k === 0 && para.images.length) placeImages(para, s, inner); 
+                        //行数をカウント
+                        used++;
+                        off += line.length;
+                    })
+                }  
+            } 
+        }
+
 
         // ファイルが選択されたときの処理
         fileInput.onchange = async function(e) {
@@ -658,20 +693,6 @@
             const sect = doc.getElementsByTagNameNS(W, 'sectPr');
             console.log(`セクションは${sect.length}個あるわよ`, sect);
 
-            // const last = sect[sect.length - 1];
-            // console.log('設定内容を取り出したわよ', last);
-
-            // //最後のセクションの設定を取り出す
-            // const setting = readSect(last);
-            // console.log('設定内容を含むタグと属性を全部見てみた', whole_get);
-            // console.log('用紙の設定', setting);
-            // // 全体の設定内容をリストに追加する
-            // for (const [key, value] of Object.entries(setting)) {
-            //     const li = document.createElement('li');
-            //     li.textContent = `${key}: ${value}`;
-            //     setting_list.appendChild(li);
-            // }
-
             //段落を取り出す
             console.log('次は本文のXMLからテキストを取り出すわよ')
 
@@ -689,119 +710,25 @@
                 return obj;
             } 
 
-            pagesBox.innerHTML = '';
-            //入れ子に整形する。セクションと段落の関係を整理する
-            const sections = splitSections(doc);
-            for (const sec of sections) {
-            const s = readSect(sec.sp, basePt, baseFont);    // ② セクションの設定を読む
-            s.compress = compress !== 'doNotCompress';  // 鍵括弧と句読点を詰めるかどうか
-            let inner = null, used = 0;
-
-
-
-                for (const p of sec.paras) {
-                    //文字をとって
-                    const para = text_take(p, s);
-
-                    //行ごとにわけて
-                    const lines = splitLines(para, s);
-
-                    //offには、その行が何文字目からはじまるかいれる
-                    let off = 0;
-
-                    //紙につめていく
-                    lines.forEach((line,k) => {
-                        //紙がなかったら新しい紙を作る
-                        if (!inner || used >= s.lines){
-                            //セクションの設定をよみとって紙
-                            inner = makePage(s);
-                            used = 0;
-                        }
-                        //行のdivをつくって紙にいれる
-                        const d = makeLine(line, para, s, k === 0,off);
-                        inner.appendChild(d);
-                        if (k === 0 && para.images.length) placeImages(para, s, inner); 
-                        //行数をカウント
-                        used++;
-                        off += line.length;
-                    })
-                }
-                
-                
-            } 
-
-
-
-            
-            
-
-            
-
-            // //次のセクションに行くまで段落のオブジェクトをparasに集め、終わったらsectionsに追加する
-            // ps.forEach((p,i) => {
-            //     //パラグラフのオブジェクトをつくって詰めてく
-            //     paras.push(making_obj_for_para(p,i));
-            //     //セクションの終わりか判定する
-            //     const pPr = [...p.children].find(c => c.localName === 'pPr');
-            //     const sp = pPr && [...pPr.children].find(c => c.localName === 'sectPr');
-            //     if (sp) {                                    // ここでセクションが終わる
-            //         //終わったらsectionsに追加してparasを空にする
-            //         sections.push({ no: sections.length + 1, setting: readSect(sp), paras });
-            //         paras = [];
-            //     }
-            // });
-
-
-
-            // //最後のセクションは段落に入っていないため、ここで追加する
-            // const body = doc.getElementsByTagNameNS(W, 'body')[0];
-            // const lastSp = [...body.children].find(c => c.localName === 'sectPr');
-            // sections.push({ no: sections.length + 1, setting: readSect(lastSp), paras });
-            // console.log('入れ子の形', sections);
-
-
-
-
-            // //テキストを取り出す
-            // // console.log('次は段落の中のテキストを取り出すとこんな感じ',ps[0])
-            // // console.log('次は段落の中のテキストを取り出すyo')
-            // // console.log('前にリストに追加した文は消すね')
-            // // main_list.innerHTML = '';
-            // // for (const p of ps) {
-            // //     const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
-            // //     console.log('段落の中のテキストを取り出したyo', text);
-            // //     const li = document.createElement('li');
-            // //     li.textContent = text;
-            // //     main_list.appendChild(li);
-            // //     console.log('段落の中のテキストをリストに追加したyo', li);
-            // // }
-            // list.innerHTML = '';
-            // for (const sec of sections) {
-            //     const li = document.createElement('li');
-            //     const st = sec.setting;
-            //     li.textContent = `セクション${sec.no}（${sec.paras.length}段落／${st.width}×${st.height}mm／余白 上${st.top} 下${st.bottom} 左${st.left} 右${st.right}）`;
-            //     const inner = document.createElement('ol');  // セクションの中に、段落の一覧を入れる
-            //     for (const para of sec.paras) {
-            //         if (!para.text) continue;
-            //         const pli = document.createElement('li');
-            //         pli.value = para.index + 1;              // 番号を文書全体の段落番号にそろえる
-            //         pli.textContent = para.text;
-            //         inner.appendChild(pli);
-            //     }
-            //     li.appendChild(inner);
-            //     list.appendChild(li);
-            // }
-            // const setting = sections[sections.length - 1].setting;
-
-            // msg.textContent = `${file.name}：${ps.length} 段落／${sections.length}セクション／用紙 ${setting.width}×${setting.height}mm ${setting.dir === 'tbRl' ? '縦書き' : '横書き'}／余白 上${setting.top} 下${setting.bottom} 左${setting.left} 右${setting.right}mm`;
-
+            DOC = doc;
+            FILE_NAME = file.name;
+            CTX = { basePt, baseFont, compress};
+            render();
+        };
+                // 保存ボタン（クロード作成）
+        document.getElementById('saveBtn').onclick = () => {
+            if (!DOC) return;                                      // まだ読み込んでいなければ何もしない
+            // DOC（XML の DOM）を文字列に戻す。先頭の <?xml ...?> は付け直す
+            let xml = new XMLSerializer().serializeToString(DOC).replace(/^<\?xml[^>]*\?>\s*/, '');
+            xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + xml;
+            const data = new TextEncoder().encode(xml);            // 文字列 → バイト
+            // document.xml だけ差し替えて、ほかのファイルはそのまま
+            const out = FILES.map(f => f.name === 'word/document.xml' ? { name: f.name, data } : f);
+            const a = document.createElement('a');                 // ダウンロード用のリンクを作ってクリック
+            a.href = URL.createObjectURL(zip(out));
+            a.download = FILE_NAME.replace(/\.docx$/i, '') + '_返り点.docx';
+            a.click();
         };
 
-
-
-
-
-
-        
     </script>
 </html>
