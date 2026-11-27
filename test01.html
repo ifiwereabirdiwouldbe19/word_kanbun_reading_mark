@@ -294,6 +294,8 @@
             let text = '';
             const tcy = [];
             const images = [];
+            const map = [];
+
             const inTextBox = el => {
                 for (let e = el.parentNode;e; e = e.parentNode) if (e.localName === 'txbxContent') return true;
                 return false;
@@ -304,10 +306,11 @@
                 //brの時は改行しなきゃいけないから、brの時は改行を入れるようにする
                 for (const c of r.children){
                     if(c.localName === 't'){
+                        for (let k = 0; k < c.textContent.length; k++) map.push({ t: c, pos: k }); 
                         rt += c.textContent;
                     }else if (c.localName === 'br'){
                         const type = attr(c,'type');
-                        if(type !== 'page' && type !== 'column') rt += '\n';
+                         if(type !== 'page' && type !== 'column') { rt += '\n'; map.push(null);}
                     }else if (c.localName === 'drawing') {
                         const im = readDrawing(c);
                         if (im) images.push(im);
@@ -357,7 +360,7 @@
             const sizePt = sz ? Number(attr(sz, 'val')) / 2 : s.fontPt;
             const font = fontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || s.font;
             const latinFont = latinFontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || font;
-            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy, images, latinFont };
+            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy, images, latinFont, map, el: p };
         }
         
         //段落の文章を行ごとに分割
@@ -493,18 +496,22 @@
                             continue;
                         }
                         const ch = text[i];
+                        const sp = document.createElement('span');
+                        sp.textContent = ch;
+                        sp.dataset.p = para.no;
+                        sp.dataset.i = off + i;
                         const prevP = i > 0 && PUNCT.includes(text[i - 1]);               // 前が。とかか
                         const nextP = i < text.length - 1 && PUNCT.includes(text[i + 1]); // 後ろが。とかか
                         if (s.compress && PUNCT.includes(ch) && (prevP || nextP)) {
                             // 続いた場合、 → span で囲んで半分に詰める
-                            const sp = document.createElement('span');
-                            sp.textContent = ch;
+
+
                             sp.style.textSpacingTrim = 'trim-all';
                             sp.style.letterSpacing = ((s.charPt - s.fontPt) / 2) + 'pt';
                             d.append(sp);
                         } else {
                             // それ以外 → そのまま文字として入れる
-                            d.append(ch);
+                            d.append(sp);
                         }
                     }
                 }
@@ -728,6 +735,16 @@
             a.href = URL.createObjectURL(zip(out));
             a.download = FILE_NAME.replace(/\.docx$/i, '') + '_返り点.docx';
             a.click();
+        };
+
+        //ページのどこかをクリックしたらそこから一番近い場所の処理を開始
+        pagesBox.onclick = e => {
+            const sp = e.target.closest('span[data-i]');   // クリックした場所に一番近い、字の span
+            if (!sp) return;
+            const para = PARAS[sp.dataset.p];
+            const i = Number(sp.dataset.i);
+            const m = para.map[i];
+            console.log('クリックした字', para.text[i], '→ XML では', m && m.t.textContent[m.pos], m);
         };
 
     </script>
