@@ -8,10 +8,20 @@
 <body>
     <!-- ファイルを入れるインプット -->
     <input type="file" id="fileInput" accept=".docx">
+    <button id="saveBtn">docxで保存</button>
     <p id="msg"></p>
     <ol id="list"></ol>
 
     <div id="pages"></div>
+
+    <!-- 返り点モーダル -->
+    <dialog id="kaeriDlg">
+        <div id="dlgChars"></div>                       <!-- 選んだ字と返り点 -->
+        <div id="dlgButtons"></div>                     <!-- 返り点のボタン -->
+        <p>読む順：<span id="dlgReading"></span></p>    <!-- 書き下しの順番 -->
+        <button id="dlgApply">反映</button>
+        <button id="dlgCancel">キャンセル</button>
+    </dialog>
     
 </body>
     <script>
@@ -20,15 +30,29 @@
         const msg = document.getElementById('msg');
         const list = document.getElementById('list');
         const pagesBox = document.getElementById('pages')
+        const dlg = document.getElementById('kaeriDlg');
+        const dlgChars = document.getElementById('dlgChars');
+        const dlgButtons = document.getElementById('dlgButtons');
+        const dlgReading = document.getElementById('dlgReading');
         const isLatin = c => /[!-~]/.test(c);
         const mm = tw =>    tw ? Math.round(Number(tw) / 56.6929) : null;    // twip → mm
+        const KAERI = { right: 9, down: 6, box: 12, font: 6 };// 返り点の箱の位置と大きさ（pt）。あとで変えたくなったらここだけ直す
+        const KAERI_VIEW = { left: -10, top: 4 };
         const W = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
         const WP = 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing';
         const A  = 'http://schemas.openxmlformats.org/drawingml/2006/main';
         const R  = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+        const WPS = 'http://schemas.microsoft.com/office/word/2010/wordprocessingShape';
+        const MC  = 'http://schemas.openxmlformats.org/markup-compatibility/2006';
         const emu = v => Number(v) / 12700;      // EMU → pt
         let RELS = {};                           // rId → 画像ファイルの場所
         let FILES = [];                          // zip の中身
+        let DOC = null ;
+        let CTX = null;
+        let PARAS = [];
+        let FILE_NAME = '';
+        let SEL = null;
+
         const pt = tw => tw / 20;
         //クロード考案要素の子を取り出す関数と属性を取り出す関数。ない時はnullを返す
         const child = (el, name) => el && [...el.children].find(c => c.localName === name);
@@ -43,6 +67,21 @@
         //行末に入ってはいけないもの
         const OPEN = '「『（〔【〈《';
 
+
+
+        const MARK_BTNS = ['レ', '一', '二', '三', '四', '上', '中', '下', '甲', '乙', '丙', '丁', '一レ', '上レ', '甲レ'];
+        const GROUPS = [['一', '二', '三', '四'], ['上', '中', '下'], ['甲', '乙', '丙', '丁'], ['天', '地', '人']];
+        // 返り点のボタンを作る（最初に1回だけ）
+        for (const mk of [...MARK_BTNS, '']) {
+            const b = document.createElement('button');
+            b.textContent = mk || '消す';
+            b.onclick = () => {
+                SEL.marks[SEL.cur] = mk;                                  // 下書きを変える
+                if (SEL.cur < SEL.marks.length - 1) SEL.cur++;            // 次の字へ進む
+                drawDialog();
+            };
+            dlgButtons.append(b);
+        }
 
         const halfAt = (t, i) =>{
             const prev = t[i - 1], next = t[i+1];
@@ -119,6 +158,41 @@
             return files;
         }
 
+        //zipを作る関数（クロード作成）
+                // CRC32（zip に入れるファイルごとの検査用の数）を計算するための表
+        const CRC = (() => { const t = []; for (let n = 0; n < 256; n++) { let c = n;
+            for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+        const crc32 = u8 => { let c = 0xFFFFFFFF; for (const b of u8) c = CRC[(c ^ b) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+
+        // files（{name, data} の配列）を zip にする。unzip の逆
+        function zip(files) {
+            const enc = new TextEncoder(), parts = [], central = [];
+            let offset = 0;
+            for (const f of files) {
+                const name = enc.encode(f.name), crc = crc32(f.data), size = f.data.length;
+                const lh = new DataView(new ArrayBuffer(30));          // ラベル（各ファイルの前に付ける）
+                lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true);
+                lh.setUint16(12, 0x21, true);
+                lh.setUint32(14, crc, true); lh.setUint32(18, size, true); lh.setUint32(22, size, true);
+                lh.setUint16(26, name.length, true);
+                parts.push(new Uint8Array(lh.buffer), name, f.data);
+
+                const ch = new DataView(new ArrayBuffer(46));          // 目次の1項目
+                ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true);
+                ch.setUint16(8, 0x0800, true); ch.setUint16(14, 0x21, true);
+                ch.setUint32(16, crc, true); ch.setUint32(20, size, true); ch.setUint32(24, size, true);
+                ch.setUint16(28, name.length, true); ch.setUint32(42, offset, true);
+                central.push(new Uint8Array(ch.buffer), name);
+                offset += 30 + name.length + size;
+            }
+            const cdSize = central.reduce((n, a) => n + a.length, 0);
+            const end = new DataView(new ArrayBuffer(22));             // 裏表紙
+            end.setUint32(0, 0x06054b50, true);
+            end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+            end.setUint32(12, cdSize, true); end.setUint32(16, offset, true);
+            return new Blob([...parts, ...central, new Uint8Array(end.buffer)]);
+        }
+
 
         // ファイルを読み込んで本文のXMLを取り出す関数
         async function readXML(files,name){
@@ -147,6 +221,151 @@
             return attr(el, 'val') || 'doNotCompress';   // 書かれていなければ「詰めない」
         }
 
+                // 返り点 mark を入れた「浮かせた箱」の run を、XML の文字列で作る
+        function kaeriRunXML(mark, id, fontXML) {
+            const EMU = 12700;                        // 1pt = 12700 EMU
+            const e = KAERI.box * EMU;                // 箱の大きさ
+            return `<w:r xmlns:w="${W}" xmlns:wp="${WP}" xmlns:a="${A}" xmlns:wps="${WPS}" xmlns:mc="${MC}">
+        <mc:AlternateContent><mc:Choice Requires="wps"><w:drawing>
+        <wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="${251660000 + id}" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">
+        <wp:simplePos x="0" y="0"/>
+        <wp:positionH relativeFrom="character"><wp:posOffset>${KAERI.right * EMU}</wp:posOffset></wp:positionH>
+        <wp:positionV relativeFrom="line"><wp:posOffset>${KAERI.down * EMU}</wp:posOffset></wp:positionV>
+        <wp:extent cx="${e}" cy="${e}"/><wp:effectExtent l="0" t="0" r="0" b="0"/><wp:wrapNone/>
+        <wp:docPr id="${id}" name="返り点 ${id}" descr="kaeriten"/><wp:cNvGraphicFramePr/>
+        <a:graphic><a:graphicData uri="${WPS}"><wps:wsp><wps:cNvSpPr txBox="1"/>
+        <wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${e}" cy="${e}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln></wps:spPr>
+        <wps:txbx><w:txbxContent><w:p><w:pPr><w:snapToGrid w:val="0"/><w:spacing w:line="240" w:lineRule="auto"/><w:jc w:val="center"/></w:pPr>
+        <w:r><w:rPr>${fontXML}<w:sz w:val="${KAERI.font * 2}"/></w:rPr><w:t>${mark}</w:t></w:r></w:p></w:txbxContent></wps:txbx>
+        <wps:bodyPr rot="0" vert="eaVert" wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr" anchorCtr="0"><a:noAutofit/></wps:bodyPr>
+        </wps:wsp></a:graphicData></a:graphic></wp:anchor></w:drawing></mc:Choice></mc:AlternateContent></w:r>`
+                .replace(/>\s+</g, '><');             // 見やすさのための改行を消す
+        }
+
+        // 範囲の字と、今付いている返り点を下書きにして、モーダルを開く
+        function openDialog(para, start, end) {
+            const marks = [];
+            for (let i = start; i <= end; i++) {
+                const m = para.marks.find(m => m.at === i);
+                marks.push(m ? m.text : '');
+            }
+            SEL = { para, start, marks, cur: 0 };
+            drawDialog();
+            dlg.showModal();
+        }
+
+        // モーダルの中身を、下書きに合わせて描き直す
+        function drawDialog() {
+            const { para, start, marks } = SEL;
+            dlgChars.innerHTML = '';
+            marks.forEach((mk, k) => {
+                const sp = document.createElement('span');
+                sp.textContent = para.text[start + k] === '\n' ? '' : para.text[start + k];
+                if (k === SEL.cur) sp.className = 'cur';
+                if (mk) {
+                    const ms = document.createElement('span');
+                    ms.className = 'mk';
+                    ms.textContent = mk;
+                    sp.append(ms);
+                }
+                sp.onclick = () => { SEL.cur = k; drawDialog(); };       // 字をクリックで選ぶ
+                dlgChars.append(sp);
+            });
+            const order = readingOrder(marks);
+            dlgReading.textContent = order.map(k => para.text[start + k]).join('');
+        }
+
+        // w:t の at 文字目から後ろを、新しい run に移す。新しい run の w:t を返す
+        function cutRun(t, at) {
+            const r = t.parentNode;
+            const kids = [...r.children], k = kids.indexOf(t);
+            const after = r.cloneNode(true);                         // run を丸ごと複製
+            const akids = [...after.children];
+            akids.slice(0, k).forEach(c => { if (c.localName !== 'rPr') c.remove(); });  // 複製から前の部分を消す
+            akids[k].textContent = t.textContent.slice(at);         // 複製の w:t は後ろ半分
+            kids.slice(k + 1).forEach(c => c.remove());              // 元から後ろの部分を消す
+            t.textContent = t.textContent.slice(0, at);              // 元の w:t は前半分
+            for (const x of [t, akids[k]])                           // 前後の空白が消えないように
+                x.setAttributeNS('http://www.w3.org/XML/1998/namespace', 'xml:space', 'preserve');
+            r.after(after);
+            return akids[k];
+        }
+
+        function parseMark(s) {
+            const re = (s || '').includes('レ');               // レ を含むか（レ、一レ、上レ）
+            const base = (s || '').replace('レ', '');           // レ 以外の部分（一、上 など）
+            const g = GROUPS.findIndex(x => x.includes(base));  // どのグループか
+            return { re, g, rank: g >= 0 ? GROUPS[g].indexOf(base) : -1 };   // rank：0 なら一・上・甲・天
+        }
+
+        // marks[k] は k 文字目の返り点。読む順の番号の配列を返す
+        function readingOrder(marks) {
+            const n = marks.length, P = marks.map(parseMark);
+            const done = new Array(n).fill(false), order = [];
+            const hold = GROUPS.map(() => []);                  // 一・上 などを待っている字
+
+            function read(k) {
+                if (done[k]) return;
+                done[k] = true;
+                order.push(k);
+                const m = P[k];
+                if (m.rank === 0) {                             // 一・上・甲・天 を読んだ → 待っていた二・三… を順に読む
+                    const h = hold[m.g].sort((a, b) => P[a].rank - P[b].rank);
+                    hold[m.g] = [];
+                    h.forEach(read);
+                }
+                if (k > 0 && P[k - 1].re) read(k - 1);         // すぐ上の字が レ なら、続けて読む
+            }
+
+            for (let k = 0; k < n; k++) {
+                const m = P[k];
+                if (m.re) continue;                             // レ・一レ：すぐ下の字を読むまで待つ
+                if (m.rank > 0) { hold[m.g].push(k); continue; } // 二・三・下 など：一・上 を待つ
+                read(k);
+            }
+            for (let k = 0; k < n; k++) if (!done[k]) order.push(k);   // 付け方がおかしくて残った字
+            return order;
+        }
+
+
+
+        // 文書の中で使われている図の番号（docPr の id）の、次の番号
+        function nextDocPrId() {
+            let max = 0;
+            for (const d of DOC.getElementsByTagNameNS(WP, 'docPr')) max = Math.max(max, Number(d.getAttribute('id')) || 0);
+            return max + 1;
+        }
+
+        // para の i 文字目の字の後ろに、返り点 mark を差し込む
+        function insertMark(para, i, mark) {
+            const m = para.map[i];
+            if (!m) return;
+            const { t, pos } = m;
+            // 親の字の後ろで run を切る（親の字が w:t の最後の字なら切らなくてよい）
+            if (pos < t.textContent.length - 1) cutRun(t, pos + 1);
+            const r = t.parentNode;
+            // 返り点のフォントは、親の字と同じにする
+            const rf = child(child(r, 'rPr'), 'rFonts');
+            const fontXML = rf ? new XMLSerializer().serializeToString(rf) : '';
+            // 文字列の XML を要素にして、親の字の run のすぐ後ろに入れる
+            const xml = kaeriRunXML(mark, nextDocPrId(), fontXML);
+            const node = new DOMParser().parseFromString(xml, 'application/xml').documentElement;
+            r.after(DOC.importNode(node, true));
+        }
+        // 返り点の文字を書き換える
+        function editMark(m, mark) {
+            // 箱の中身は、新旧の Word 用に2か所あることがあるので、全部書き換える
+            for (const box of m.run.getElementsByTagNameNS(W, 'txbxContent')) {
+                const ts = [...box.getElementsByTagNameNS(W, 't')];
+                ts[0].textContent = mark;                 // 1つ目の w:t を新しい返り点にする
+                ts.slice(1).forEach(t => t.remove());     // 2つ目以降があれば消す
+            }
+        }
+
+        // 返り点を消す（返り点の run を丸ごと取り除く）
+        function removeMark(m) {
+            m.run.remove();
+        }
 
         //文字の大きさを取り出す関数
         function readBaseSize(styles) {
@@ -248,37 +467,15 @@
 
             return s;
         };
-         // セクションの中から設定を読む関数(もともとのやつ)
-            // const readSect = sp => {                                         // 1つの sectPr から設定を読む
-            //     const get = (tag, attr) => {
-            //         const el = sp.getElementsByTagNameNS(W, tag)[0];
-            //         return el ? el.getAttributeNS(W, attr) : null;
-            //     };
-            //     return {
-            //         width:  mm(get('pgSz', 'w')),
-            //         height: mm(get('pgSz', 'h')),
-            //         orient: get('pgSz', 'orient') || 'portrait',
-            //         top:    mm(get('pgMar', 'top')),
-            //         bottom: mm(get('pgMar', 'bottom')),
-            //         left:   mm(get('pgMar', 'left')),
-            //         right:  mm(get('pgMar', 'right')),
-            //         dir:    get('textDirection', 'val'),
-            //         type:   get('type', 'val') || 'nextPage',   // 区切りの種類（書いていなければ「次のページから」）
-            //     };
-            // };
-
-                
-        
-        //段落の中のテキストを取り出す関数のもともとのやつ
-        // const text_take = p =>{
-        //     const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
-        //     return text;
-        // }
+ 
         // 段落の中のテキストだけでなく、字下げや行揃え、フォントサイズの情報も取り出す関数
         function text_take(p,s){
             let text = '';
             const tcy = [];
             const images = [];
+            const map = [];
+            const marks = [];
+
             const inTextBox = el => {
                 for (let e = el.parentNode;e; e = e.parentNode) if (e.localName === 'txbxContent') return true;
                 return false;
@@ -289,13 +486,22 @@
                 //brの時は改行しなきゃいけないから、brの時は改行を入れるようにする
                 for (const c of r.children){
                     if(c.localName === 't'){
+                        for (let k = 0; k < c.textContent.length; k++) map.push({ t: c, pos: k }); 
                         rt += c.textContent;
                     }else if (c.localName === 'br'){
                         const type = attr(c,'type');
-                        if(type !== 'page' && type !== 'column') rt += '\n';
+                         if(type !== 'page' && type !== 'column') { rt += '\n'; map.push(null);}
                     }else if (c.localName === 'drawing') {
                         const im = readDrawing(c);
                         if (im) images.push(im);
+                    }else if (c.localName === 'AlternateContent') {      
+                        // 返り点の箱か？（insertMark で付けた目印 descr="kaeriten" を見る）
+                        const pr = c.getElementsByTagNameNS(WP, 'docPr')[0];
+                        if (pr && pr.getAttribute('descr') === 'kaeriten') {
+                            const box = c.getElementsByTagNameNS(W, 'txbxContent')[0];
+                            const mt = [...box.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
+                            marks.push({ at: text.length + rt.length - 1, text: mt, run: r });
+                        }
                     }
                 }
 
@@ -342,7 +548,7 @@
             const sizePt = sz ? Number(attr(sz, 'val')) / 2 : s.fontPt;
             const font = fontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || s.font;
             const latinFont = latinFontFromRFonts(child(child(run, 'rPr'), 'rFonts'), THEME) || font;
-            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy, images, latinFont };
+            return { text, left, first, jc, pageBreak, breakBefore, sizePt, font, tcy, images, latinFont, map, marks, el: p };
         }
         
         //段落の文章を行ごとに分割
@@ -386,19 +592,7 @@
                 }else if (PUNCT.includes(t[i])) {
                     w = (s.compress && halfAt(t, i)) ? 0.5 : 1;
                 }
-                // }else if (PUNCT.includes(t[i])){
-                //     const prevP = i > 0 && PUNCT.includes(t[i - 1]);
-                //     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);
-                //     if (!prevP && !nextP) w = 1;
-                // }
 
-            
-
-                // if (PUNCT.includes(t[i])) {
-                //     const prevP = i > 0 && PUNCT.includes(t[i - 1]);              // 前の文字が約物か
-                //     const nextP = i < t.length - 1 && PUNCT.includes(t[i + 1]);   // 後ろの文字が約物か
-                //     if (!prevP && !nextP) w = 1;   // 前も後ろも約物でなければ、1マスに戻す
-                // }
                 const tol = (s.charPt - s.fontPt) / s.charPt;
                 //一行に入る文字より大きくなった時、一行分を切り出してoutにいれるよっ
                 if ( used + w > one_line + tol && i > start ){
@@ -410,23 +604,7 @@
                             i += len - 1;
                             continue;
                         }
-                    //     if (s.compress && used + w - one_line <= slack) {
-                    //         used += w;
-                    //         i += len - 1;
-                    //         continue;
-                    //     }
-                    // //前の文字が開きカッコとかだったら詰めて入れなきゃいけないところをいれる
-                    // if(s.compress && OPEN.includes(t[i-1])){
-                    
-                    //         used += w;
-                    //         continue;
-                        
-                    //     // if (i - 1 > start) {
-                    //     //     out.push(t.slice(start, i - 1));
-                    //     //     start = i - 1; i = i - 2; used = 0; slack = 0;
-                    //     //     continue;
-                    //     // }
-                    // }
+
                     //startからｊまでの文字を切り出してoutに入れる
                     let j = i;
                     //大きくなる分が一～二文字文で、かつ「。」とか「、」の時
@@ -506,19 +684,40 @@
                             continue;
                         }
                         const ch = text[i];
+                        const sp = document.createElement('span');
+                        sp.textContent = ch;
+                        sp.dataset.p = para.no;
+                        sp.dataset.i = off + i;
                         const prevP = i > 0 && PUNCT.includes(text[i - 1]);               // 前が。とかか
                         const nextP = i < text.length - 1 && PUNCT.includes(text[i + 1]); // 後ろが。とかか
                         if (s.compress && PUNCT.includes(ch) && (prevP || nextP)) {
                             // 続いた場合、 → span で囲んで半分に詰める
-                            const sp = document.createElement('span');
-                            sp.textContent = ch;
                             sp.style.textSpacingTrim = 'trim-all';
                             sp.style.letterSpacing = ((s.charPt - s.fontPt) / 2) + 'pt';
-                            d.append(sp);
-                        } else {
-                            // それ以外 → そのまま文字として入れる
-                            d.append(ch);
+                            // d.append(sp);
                         }
+                        for(const m of para.marks.filter(m => m.at === off + i)){
+                            sp.style.position = 'relative';           // 返り点の位置の基準にする
+                            const ms = document.createElement('span');
+                            ms.textContent = m.text;
+                            Object.assign(ms.style, {
+                                position: 'absolute',                  // 字の並びに影響しない
+                                left: KAERI_VIEW.left + 'pt',
+                                top: KAERI_VIEW.top + 'pt',
+                                width: KAERI.box + 'pt',
+                                height: KAERI.box + 'pt',
+                                lineHeight: KAERI.box + 'pt',
+                                fontSize: KAERI.font + 'pt',
+                                letterSpacing: '0',
+                                textAlign: 'center',
+                            });
+                            sp.append(ms);
+                        }
+                        
+                        // else {
+                        //     // それ以外 → そのまま文字として入れる
+                            d.append(sp);
+                        // }
                     }
                 }
             d.style.whiteSpace = 'pre';
@@ -621,6 +820,54 @@
             }
         }
 
+        function render() {
+            
+            pagesBox.innerHTML = '';
+            //からにする
+            PARAS = [];
+            console.log('からにするよ')
+
+            //入れ子に整形する。セクションと段落の関係を整理する
+            const sections = splitSections(DOC);
+            for (const sec of sections) {
+            const s = readSect(sec.sp, CTX.basePt, CTX.baseFont);    // ② セクションの設定を読む
+            s.compress = CTX.compress !== 'doNotCompress';  // 鍵括弧と句読点を詰めるかどうか
+            let inner = null, used = 0;
+
+
+
+                for (const p of sec.paras) {
+                    //文字をとって
+                    const para = text_take(p, s);
+                    para.no = PARAS.length;
+                    PARAS.push(para);
+
+                    //行ごとにわけて
+                    const lines = splitLines(para, s);
+
+                    //offには、その行が何文字目からはじまるかいれる
+                    let off = 0;
+
+                    //紙につめていく
+                    lines.forEach((line,k) => {
+                        //紙がなかったら新しい紙を作る
+                        if (!inner || used >= s.lines){
+                            //セクションの設定をよみとって紙
+                            inner = makePage(s);
+                            used = 0;
+                        }
+                        //行のdivをつくって紙にいれる
+                        const d = makeLine(line, para, s, k === 0,off);
+                        inner.appendChild(d);
+                        if (k === 0 && para.images.length) placeImages(para, s, inner); 
+                        //行数をカウント
+                        used++;
+                        off += line.length;
+                    })
+                }  
+            } 
+        }
+
 
         // ファイルが選択されたときの処理
         fileInput.onchange = async function(e) {
@@ -658,20 +905,6 @@
             const sect = doc.getElementsByTagNameNS(W, 'sectPr');
             console.log(`セクションは${sect.length}個あるわよ`, sect);
 
-            // const last = sect[sect.length - 1];
-            // console.log('設定内容を取り出したわよ', last);
-
-            // //最後のセクションの設定を取り出す
-            // const setting = readSect(last);
-            // console.log('設定内容を含むタグと属性を全部見てみた', whole_get);
-            // console.log('用紙の設定', setting);
-            // // 全体の設定内容をリストに追加する
-            // for (const [key, value] of Object.entries(setting)) {
-            //     const li = document.createElement('li');
-            //     li.textContent = `${key}: ${value}`;
-            //     setting_list.appendChild(li);
-            // }
-
             //段落を取り出す
             console.log('次は本文のXMLからテキストを取り出すわよ')
 
@@ -689,119 +922,57 @@
                 return obj;
             } 
 
-            pagesBox.innerHTML = '';
-            //入れ子に整形する。セクションと段落の関係を整理する
-            const sections = splitSections(doc);
-            for (const sec of sections) {
-            const s = readSect(sec.sp, basePt, baseFont);    // ② セクションの設定を読む
-            s.compress = compress !== 'doNotCompress';  // 鍵括弧と句読点を詰めるかどうか
-            let inner = null, used = 0;
-
-
-
-                for (const p of sec.paras) {
-                    //文字をとって
-                    const para = text_take(p, s);
-
-                    //行ごとにわけて
-                    const lines = splitLines(para, s);
-
-                    //offには、その行が何文字目からはじまるかいれる
-                    let off = 0;
-
-                    //紙につめていく
-                    lines.forEach((line,k) => {
-                        //紙がなかったら新しい紙を作る
-                        if (!inner || used >= s.lines){
-                            //セクションの設定をよみとって紙
-                            inner = makePage(s);
-                            used = 0;
-                        }
-                        //行のdivをつくって紙にいれる
-                        const d = makeLine(line, para, s, k === 0,off);
-                        inner.appendChild(d);
-                        if (k === 0 && para.images.length) placeImages(para, s, inner); 
-                        //行数をカウント
-                        used++;
-                        off += line.length;
-                    })
-                }
-                
-                
-            } 
-
-
-
-            
-            
-
-            
-
-            // //次のセクションに行くまで段落のオブジェクトをparasに集め、終わったらsectionsに追加する
-            // ps.forEach((p,i) => {
-            //     //パラグラフのオブジェクトをつくって詰めてく
-            //     paras.push(making_obj_for_para(p,i));
-            //     //セクションの終わりか判定する
-            //     const pPr = [...p.children].find(c => c.localName === 'pPr');
-            //     const sp = pPr && [...pPr.children].find(c => c.localName === 'sectPr');
-            //     if (sp) {                                    // ここでセクションが終わる
-            //         //終わったらsectionsに追加してparasを空にする
-            //         sections.push({ no: sections.length + 1, setting: readSect(sp), paras });
-            //         paras = [];
-            //     }
-            // });
-
-
-
-            // //最後のセクションは段落に入っていないため、ここで追加する
-            // const body = doc.getElementsByTagNameNS(W, 'body')[0];
-            // const lastSp = [...body.children].find(c => c.localName === 'sectPr');
-            // sections.push({ no: sections.length + 1, setting: readSect(lastSp), paras });
-            // console.log('入れ子の形', sections);
-
-
-
-
-            // //テキストを取り出す
-            // // console.log('次は段落の中のテキストを取り出すとこんな感じ',ps[0])
-            // // console.log('次は段落の中のテキストを取り出すyo')
-            // // console.log('前にリストに追加した文は消すね')
-            // // main_list.innerHTML = '';
-            // // for (const p of ps) {
-            // //     const text = [...p.getElementsByTagNameNS(W, 't')].map(t => t.textContent).join('');
-            // //     console.log('段落の中のテキストを取り出したyo', text);
-            // //     const li = document.createElement('li');
-            // //     li.textContent = text;
-            // //     main_list.appendChild(li);
-            // //     console.log('段落の中のテキストをリストに追加したyo', li);
-            // // }
-            // list.innerHTML = '';
-            // for (const sec of sections) {
-            //     const li = document.createElement('li');
-            //     const st = sec.setting;
-            //     li.textContent = `セクション${sec.no}（${sec.paras.length}段落／${st.width}×${st.height}mm／余白 上${st.top} 下${st.bottom} 左${st.left} 右${st.right}）`;
-            //     const inner = document.createElement('ol');  // セクションの中に、段落の一覧を入れる
-            //     for (const para of sec.paras) {
-            //         if (!para.text) continue;
-            //         const pli = document.createElement('li');
-            //         pli.value = para.index + 1;              // 番号を文書全体の段落番号にそろえる
-            //         pli.textContent = para.text;
-            //         inner.appendChild(pli);
-            //     }
-            //     li.appendChild(inner);
-            //     list.appendChild(li);
-            // }
-            // const setting = sections[sections.length - 1].setting;
-
-            // msg.textContent = `${file.name}：${ps.length} 段落／${sections.length}セクション／用紙 ${setting.width}×${setting.height}mm ${setting.dir === 'tbRl' ? '縦書き' : '横書き'}／余白 上${setting.top} 下${setting.bottom} 左${setting.left} 右${setting.right}mm`;
-
+            DOC = doc;
+            FILE_NAME = file.name;
+            CTX = { basePt, baseFont, compress};
+            render();
+        };
+                // 保存ボタン（クロード作成）
+        document.getElementById('saveBtn').onclick = () => {
+            if (!DOC) return;                                      // まだ読み込んでいなければ何もしない
+            // DOC（XML の DOM）を文字列に戻す。先頭の <?xml ...?> は付け直す
+            let xml = new XMLSerializer().serializeToString(DOC).replace(/^<\?xml[^>]*\?>\s*/, '');
+            xml = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\r\n' + xml;
+            const data = new TextEncoder().encode(xml);            // 文字列 → バイト
+            // document.xml だけ差し替えて、ほかのファイルはそのまま
+            const out = FILES.map(f => f.name === 'word/document.xml' ? { name: f.name, data } : f);
+            const a = document.createElement('a');                 // ダウンロード用のリンクを作ってクリック
+            a.href = URL.createObjectURL(zip(out));
+            a.download = FILE_NAME.replace(/\.docx$/i, '') + '_返り点.docx';
+            a.click();
         };
 
+        const spanOf = n => n && (n.nodeType === 1 ? n : n.parentElement).closest('span[data-i]');
+        pagesBox.onmouseup = e => {
+            const sel = window.getSelection();
+            let a, b;
+            if (sel.isCollapsed) {                     // ドラッグしていない（ただのクリック）→ 1字だけ
+                a = b = e.target.closest('span[data-i]');
+            } else {                                   // ドラッグした → 選んだ範囲の最初と最後の字
+                a = spanOf(sel.anchorNode);
+                b = spanOf(sel.focusNode);
+            }
+            if (!a || !b) return;
+            if (a.dataset.p !== b.dataset.p) { alert('1つの段落の中で選んでください'); return; }
+            const para = PARAS[a.dataset.p];
+            const i1 = Number(a.dataset.i), i2 = Number(b.dataset.i);
+            openDialog(para, Math.min(i1, i2), Math.max(i1, i2));
+        };
+        document.getElementById('dlgApply').onclick = () => {
+            const { para, start, marks } = SEL;
+            // 後ろの字から順に処理する（理由は下）
+            for (let k = marks.length - 1; k >= 0; k--) {
+                const i = start + k, mk = marks[k];
+                const old = para.marks.find(m => m.at === i);
+                if (old && !mk) removeMark(old);                        // あった → なくした：消す
+                else if (old && mk !== old.text) editMark(old, mk);     // あった → 変えた：直す
+                else if (!old && mk && para.map[i]) insertMark(para, i, mk);   // なかった → 付けた：付ける
+            }
+            dlg.close();
+            window.getSelection().removeAllRanges();   // 本文の選択を解除
+            render();
+        };
 
-
-
-
-
-        
+        document.getElementById('dlgCancel').onclick = () => dlg.close();
     </script>
 </html>
